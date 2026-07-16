@@ -2031,6 +2031,44 @@ mod tests {
         );
     }
 
+    /// Regression: when the marker probe is unreadable (`None`),
+    /// `RecheckBootstrap` must skip re-bootstrap (to avoid rebuild storms).
+    #[tokio::test]
+    async fn test_recheck_bootstrap_skips_rebootstrap_when_marker_probe_unreadable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let storage: Box<dyn StorageAdapter> = Box::new(
+            crate::session::storage::jsonl::JsonlStorageAdapter::with_root(root.to_path_buf()),
+        );
+        let mut pending: HashMap<SessionSearchKey, Instant> = HashMap::new();
+
+        // Force probe unreadable: create a directory where the sqlite DB file
+        // path is expected.
+        let db_path = search_db_path(root);
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        assert_eq!(has_completed_bootstrap_marker(root).await, None);
+        handle_job(
+            root,
+            storage.as_ref(),
+            &mut pending,
+            SearchIndexJob::RecheckBootstrap,
+            Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(
+            has_completed_bootstrap_marker(root).await,
+            None,
+            "unreadable marker probe must remain in the None path"
+        );
+        assert!(db_path.is_dir(), "recheck should not rewrite the DB path");
+        assert!(
+            pending.is_empty(),
+            "recheck should not enqueue/debounce unrelated jobs"
+        );
+    }
+
     /// Regression shape: a v3-era indexer silently extracted "" for
     /// sessions with JSON escapes but still recorded a content hash, so at
     /// the *same* schema version the hash dedup keeps skipping identical
