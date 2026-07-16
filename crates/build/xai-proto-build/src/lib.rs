@@ -114,10 +114,20 @@ impl XaiProtoBuilder {
 
         // Can only process one input file when using --dependency_out=FILE.
         for proto in protos {
+            let temp_dir = tempfile::TempDir::new()?;
+            let depfile_path = temp_dir.path().join("protoc-deps.d");
+            let descriptor_out_path = temp_dir.path().join("protoc-descriptor.pb");
+            let depfile_path_str = depfile_path
+                .to_str()
+                .context("depfile path not UTF-8")?;
+            let descriptor_out_path_str = descriptor_out_path
+                .to_str()
+                .context("descriptor path not UTF-8")?;
+
             let mut command = Command::new(protoc.unwrap_or(Path::new("protoc")));
             command
-                .arg("--dependency_out=/dev/stdout")
-                .arg("--descriptor_set_out=/dev/null");
+                .arg(format!("--dependency_out={depfile_path_str}"))
+                .arg(format!("--descriptor_set_out={descriptor_out_path_str}"));
 
             // Add protoc's well-known types include directory first (if found).
             // This is needed for Bazel sandboxed builds where protoc and its
@@ -143,14 +153,16 @@ impl XaiProtoBuilder {
                 return Err(anyhow::anyhow!("protoc command failed"));
             }
 
-            let output =
-                String::from_utf8(output.stdout).context("protoc command output not UTF-8")?;
+            let output = std::fs::read_to_string(&depfile_path)
+                .context("protoc dependency output not UTF-8")?;
 
             let mut lines = output.lines();
             let first_line = lines.next().context("protoc command output is empty")?;
-            let prefix = "/dev/null:";
-            let rem = first_line.strip_prefix(prefix).with_context(|| {
-                format!("protoc command output must start with /dev/null: {output:?}")
+            let prefix = format!("{descriptor_out_path_str}:");
+            let rem = first_line.strip_prefix(&prefix).with_context(|| {
+                format!(
+                    "protoc command output must start with {prefix:?}: {output:?}"
+                )
             })?;
             for line in iter::once(rem).chain(lines) {
                 let line = line.trim();
@@ -272,6 +284,123 @@ impl XaiProtoBuilder {
 
         Ok(())
     }
+}
+
+#[cfg(test)]
+mod tests {
+        use super::XaiProtoBuilder;
+        use std::fs;
+        use std::path::{Path, PathBuf};
+
+        #[cfg(unix)]
+        fn write_fake_protoc(path: &Path) {
+                let script = r#"#!/bin/sh
+dep=""
+desc=""
+proto=""
+for arg in "$@"; do
+    case "$arg" in
+        */dev/stdout*|*/dev/null*)
+            exit 91
+            ;;
+        --dependency_out=*)
+            dep="${arg#--dependency_out=}"
+            ;;
+        --descriptor_set_out=*)
+            desc="${arg#--descriptor_set_out=}"
+            ;;
+        -I*)
+            ;;
+        --*)
+            ;;
+        *)
+            proto="$arg"
+            ;;
+    esac
+done
+
+[ -n "$dep" ] || exit 92
+[ -n "$desc" ] || exit 93
+[ -n "$proto" ] || exit 94
+printf "%s: %s\n" "$desc" "$proto" > "$dep"
+: > "$desc"
+exit 0
+"#;
+                fs::write(path, script).unwrap();
+                #[cfg(unix)]
+                {
+                        use std::os::unix::fs::PermissionsExt;
+                        let mut perms = fs::metadata(path).unwrap().permissions();
+                        perms.set_mode(0o755);
+                        fs::set_permissions(path, perms).unwrap();
+                }
+        }
+
+        #[cfg(windows)]
+        fn write_fake_protoc(path: &Path) {
+                let script = r#"@echo off
+setlocal EnableExtensions
+set "dep="
+set "desc="
+set "proto="
+
+:next
+if "%~1"=="" goto done
+set "arg=%~1"
+echo %arg%| findstr /C:"/dev/stdout" >nul && exit /b 91
+echo %arg%| findstr /C:"/dev/null" >nul && exit /b 92
+
+if /I "%arg:~0,17%"=="--dependency_out=" set "dep=%arg:~17%"
+if /I "%arg:~0,21%"=="--descriptor_set_out=" set "desc=%arg:~21%"
+if not "%arg:~0,2%"=="-I" if not "%arg:~0,2%"=="--" set "proto=%arg%"
+shift
+goto next
+
+:done
+if "%dep%"=="" exit /b 93
+if "%desc%"=="" exit /b 94
+if "%proto%"=="" exit /b 95
+> "%dep%" echo %desc%: %proto%
+type nul > "%desc%"
+exit /b 0
+"#;
+                fs::write(path, script).unwrap();
+        }
+
+        #[test]
+        fn emit_rerun_if_changed_uses_platform_neutral_outputs() {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let include_dir = tmp.path().join("include");
+                fs::create_dir_all(&include_dir).unwrap();
+
+                let proto = include_dir.join("sample.proto");
+                fs::write(&proto, "syntax = \"proto3\"; message A {}\n").unwrap();
+
+                #[cfg(unix)]
+                let protoc = {
+                        let p = tmp.path().join("fake-protoc.sh");
+                        write_fake_protoc(&p);
+                        p
+                };
+
+                #[cfg(windows)]
+                let protoc = {
+                        let p = tmp.path().join("fake-protoc.cmd");
+                        write_fake_protoc(&p);
+                        p
+                };
+
+                let protos: Vec<PathBuf> = vec![proto.clone()];
+                let includes: Vec<PathBuf> = vec![include_dir.clone()];
+
+                XaiProtoBuilder::emit_rerun_if_changed(
+                        Some(&protoc),
+                        None,
+                        protos.iter().map(PathBuf::as_path),
+                        includes.iter().map(PathBuf::as_path),
+                )
+                .unwrap();
+        }
 }
 
 pub fn configure() -> XaiProtoBuilder {
