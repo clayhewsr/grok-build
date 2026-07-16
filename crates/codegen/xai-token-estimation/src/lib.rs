@@ -130,6 +130,12 @@ mod tests {
     }
 
     #[test]
+    fn estimate_helpers_saturate_on_overflow() {
+        assert_eq!(estimate_chars(u64::MAX), u64::MAX);
+        assert_eq!(estimate_image_tokens(u64::MAX), u64::MAX);
+    }
+
+    #[test]
     fn usage_percentage_clamps_and_handles_zero_total() {
         assert_eq!(usage_percentage(0, 0), 0.0);
         assert_eq!(usage_percentage(50, 100), 50.0);
