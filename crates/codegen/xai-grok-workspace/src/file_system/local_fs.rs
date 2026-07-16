@@ -44,7 +44,37 @@ impl AsyncFileSystem for LocalFs {
     }
 
     async fn delete_file(&self, path: &Path) -> Result<(), FsError> {
-        fs::remove_file(path).await?;
-        Ok(())
+        match fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn delete_file_succeeds_when_target_is_already_missing() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let fs_impl = LocalFs::new(temp.path().to_path_buf());
+        let file_path = temp.path().join("rewind-race.txt");
+
+        fs::write(&file_path, b"content")
+            .await
+            .expect("create test file");
+
+        fs_impl
+            .delete_file(&file_path)
+            .await
+            .expect("first delete should succeed");
+
+        // Regression: delete should be idempotent under TOCTOU races.
+        fs_impl
+            .delete_file(&file_path)
+            .await
+            .expect("missing file delete should be treated as success");
     }
 }
