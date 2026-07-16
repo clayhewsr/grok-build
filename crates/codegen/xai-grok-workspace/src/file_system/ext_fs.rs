@@ -158,10 +158,11 @@ impl WorkspaceOp for FsDeleteFileReq {
     ) -> WorkspaceResult<Self::Response> {
         let abs_unconfined = resolve_abs(&self.path, &self.cwd, ws)?;
         let (abs, _) = ws.confine_to_workspace_root(&abs_unconfined).await?;
-        tokio::fs::remove_file(&abs)
-            .await
-            .map_err(|e| WorkspaceError::HubError(e.to_string()))?;
-        Ok(())
+        match tokio::fs::remove_file(&abs).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(WorkspaceError::HubError(e.to_string())),
+        }
     }
 }
 
@@ -556,5 +557,38 @@ mod tests {
             !data.nodes.iter().any(|n| n.path.contains("secret.txt")),
             "escaping symlink target must not be enumerated: {names:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_file_is_idempotent_for_missing_path() {
+        let ws = crate::handle::tests::make_confining_handle();
+        let root = ws.root_cwd().unwrap();
+        let rel_path = "sub/delete-me.txt";
+
+        FsWriteFileReq {
+            path: rel_path.into(),
+            cwd: Some(root.clone()),
+            content: "x".into(),
+            create_dirs: true,
+        }
+        .execute(&ws, None)
+        .await
+        .expect("seed file");
+
+        FsDeleteFileReq {
+            path: rel_path.into(),
+            cwd: Some(root.clone()),
+        }
+        .execute(&ws, None)
+        .await
+        .expect("first delete succeeds");
+
+        FsDeleteFileReq {
+            path: rel_path.into(),
+            cwd: Some(root),
+        }
+        .execute(&ws, None)
+        .await
+        .expect("missing file delete is treated as success");
     }
 }

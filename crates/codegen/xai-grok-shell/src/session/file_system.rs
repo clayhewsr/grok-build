@@ -264,8 +264,11 @@ pub(crate) fn build_file_entry(bytes: &[u8]) -> FsReadFileData {
 }
 
 pub async fn delete_file(abs_path: &Path) -> Result<()> {
-    tokio::fs::remove_file(abs_path).await?;
-    Ok(())
+    match tokio::fs::remove_file(abs_path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(test)]
@@ -355,5 +358,17 @@ mod tests {
             .unwrap();
         assert_eq!(d.size, 64);
         assert_eq!(d.content.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn delete_file_is_idempotent_for_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delete-me.txt");
+        std::fs::write(&path, b"x").unwrap();
+
+        delete_file(&path).await.expect("first delete succeeds");
+        delete_file(&path)
+            .await
+            .expect("missing file delete is treated as success");
     }
 }
