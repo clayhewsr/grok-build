@@ -3,6 +3,25 @@ use agent_client_protocol as acp;
 use std::path::{Path, PathBuf};
 use xai_acp_lib::AcpAgentGatewaySender as GatewaySender;
 
+fn ext_method_error_message(raw_response: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw_response).ok()?;
+    let error = value.get("error")?;
+    if error.is_null() {
+        return None;
+    }
+    if let Some(message) = error.as_str() {
+        return Some(message.to_string());
+    }
+    if let Some(message) = error.get("message").and_then(serde_json::Value::as_str) {
+        return Some(message.to_string());
+    }
+    Some(error.to_string())
+}
+
+fn is_not_found_error_message(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("not found")
+}
+
 pub struct AcpSessionFs {
     root: PathBuf,
     gateway: GatewaySender,
@@ -106,12 +125,33 @@ impl AsyncFileSystem for AcpSessionFs {
     }
 
     async fn delete_file(&self, path: &Path) -> Result<(), FsError> {
-        // ACP protocol doesn't support file deletion yet
-        // For now, we'll log a warning and return Ok (no-op)
-        tracing::warn!(?path, "ACP filesystem does not support file deletion");
-        Err(FsError::Other(
-            "File deletion not supported via ACP".to_string(),
-        ))
+        let resolved = self.resolve_path(path);
+        let params = serde_json::json!({
+            "sessionId": self.session_id.0.as_ref(),
+            "path": resolved.to_string_lossy(),
+        });
+        let request = acp::ExtRequest::new(
+            "x.ai/fs/delete_file",
+            serde_json::value::to_raw_value(&params)
+                .map_err(|e| FsError::Other(e.to_string()))?
+                .into(),
+        );
+
+        match self.gateway.send(request).await {
+            Ok(response) => {
+                if let Some(message) = ext_method_error_message(response.0.get()) {
+                    if is_not_found_error_message(&message) {
+                        Ok(())
+                    } else {
+                        Err(FsError::Other(message))
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+            Err(e) if e.code == acp::ErrorCode::ResourceNotFound => Ok(()),
+            Err(e) => Err(FsError::Other(e.to_string())),
+        }
     }
 }
 
@@ -175,5 +215,25 @@ mod tests {
             "src/main.rs",
         );
         assert_eq!(result, PathBuf::from("src/main.rs"));
+    }
+
+    #[test]
+    fn ext_method_error_message_reads_string_error() {
+        let message = ext_method_error_message(r#"{"result":null,"error":"boom"}"#);
+        assert_eq!(message.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn ext_method_error_message_reads_object_message() {
+        let message = ext_method_error_message(
+            r#"{"result":null,"error":{"code":"io","message":"file missing"}}"#,
+        );
+        assert_eq!(message.as_deref(), Some("file missing"));
+    }
+
+    #[test]
+    fn ext_method_error_message_ignores_null_error() {
+        let message = ext_method_error_message(r#"{"result":{},"error":null}"#);
+        assert!(message.is_none());
     }
 }
