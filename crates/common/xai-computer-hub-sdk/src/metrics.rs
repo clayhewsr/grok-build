@@ -321,6 +321,31 @@ mod inner {
         .expect("hub_tool_call_admission_wait_seconds must register once")
     });
 
+    static EVICT_DRAIN_COMPLETED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+        register_int_counter!(
+            "hub_tool_server_evict_drain_completed_total",
+            "tool_server.evict drain operations that completed within grace period."
+        )
+        .expect("hub_tool_server_evict_drain_completed_total must register once")
+    });
+
+    static EVICT_DRAIN_TIMED_OUT_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+        register_int_counter!(
+            "hub_tool_server_evict_drain_timed_out_total",
+            "tool_server.evict drain operations that timed out before all handlers completed."
+        )
+        .expect("hub_tool_server_evict_drain_timed_out_total must register once")
+    });
+
+    static EVICT_DRAIN_DURATION_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+        register_histogram!(
+            "hub_tool_server_evict_drain_duration_seconds",
+            "Duration of tool_server.evict drain operations.",
+            exponential_buckets(0.001, 2.0, 14).expect("valid bucket params")
+        )
+        .expect("hub_tool_server_evict_drain_duration_seconds must register once")
+    });
+
     pub(crate) fn pool_connections_inc() {
         POOL_CONNECTIONS.inc();
     }
@@ -480,6 +505,24 @@ mod inner {
     pub(crate) fn admission_wait_observe(secs: f64) {
         ADMISSION_WAIT_SECONDS.observe(secs);
     }
+
+    pub(crate) fn evict_drain_completed() {
+        EVICT_DRAIN_COMPLETED_TOTAL.inc();
+        #[cfg(test)]
+        crate::metrics::test_hooks::evict_drain_completed_inc();
+    }
+
+    pub(crate) fn evict_drain_timed_out() {
+        EVICT_DRAIN_TIMED_OUT_TOTAL.inc();
+        #[cfg(test)]
+        crate::metrics::test_hooks::evict_drain_timed_out_inc();
+    }
+
+    pub(crate) fn evict_drain_duration_observe(secs: f64) {
+        EVICT_DRAIN_DURATION_SECONDS.observe(secs);
+        #[cfg(test)]
+        crate::metrics::test_hooks::evict_drain_duration_inc();
+    }
 }
 
 #[cfg(not(feature = "metrics"))]
@@ -521,6 +564,54 @@ mod inner {
     pub(crate) fn tool_call_inflight_inc(_scope: &str) {}
     pub(crate) fn tool_call_inflight_dec(_scope: &str) {}
     pub(crate) fn admission_wait_observe(_secs: f64) {}
+    pub(crate) fn evict_drain_completed() {
+        #[cfg(test)]
+        crate::metrics::test_hooks::evict_drain_completed_inc();
+    }
+    pub(crate) fn evict_drain_timed_out() {
+        #[cfg(test)]
+        crate::metrics::test_hooks::evict_drain_timed_out_inc();
+    }
+    pub(crate) fn evict_drain_duration_observe(_secs: f64) {
+        #[cfg(test)]
+        crate::metrics::test_hooks::evict_drain_duration_inc();
+    }
+}
+
+#[cfg(test)]
+mod test_hooks {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct EvictDrainMetricHookSnapshot {
+        pub completed: u64,
+        pub timed_out: u64,
+        pub duration_observations: u64,
+    }
+
+    static EVICT_DRAIN_COMPLETED_HOOKS: AtomicU64 = AtomicU64::new(0);
+    static EVICT_DRAIN_TIMED_OUT_HOOKS: AtomicU64 = AtomicU64::new(0);
+    static EVICT_DRAIN_DURATION_HOOKS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn evict_drain_completed_inc() {
+        EVICT_DRAIN_COMPLETED_HOOKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn evict_drain_timed_out_inc() {
+        EVICT_DRAIN_TIMED_OUT_HOOKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn evict_drain_duration_inc() {
+        EVICT_DRAIN_DURATION_HOOKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn evict_drain_metric_hooks_snapshot_for_tests() -> EvictDrainMetricHookSnapshot {
+        EvictDrainMetricHookSnapshot {
+            completed: EVICT_DRAIN_COMPLETED_HOOKS.load(Ordering::Relaxed),
+            timed_out: EVICT_DRAIN_TIMED_OUT_HOOKS.load(Ordering::Relaxed),
+            duration_observations: EVICT_DRAIN_DURATION_HOOKS.load(Ordering::Relaxed),
+        }
+    }
 }
 
 pub(crate) use inner::admission_wait_observe;
@@ -531,6 +622,9 @@ pub(crate) use inner::cancel_hook_received;
 pub(crate) use inner::cancel_no_target;
 pub(crate) use inner::cancel_pending_tombstoned;
 pub(crate) use inner::demux_inbox_depth_set;
+pub(crate) use inner::evict_drain_completed;
+pub(crate) use inner::evict_drain_duration_observe;
+pub(crate) use inner::evict_drain_timed_out;
 pub(crate) use inner::early_notif_buffered;
 pub(crate) use inner::heartbeat_pong_dropped;
 pub(crate) use inner::hook_send;
@@ -559,6 +653,9 @@ pub(crate) use inner::tool_call_inflight_dec;
 pub(crate) use inner::tool_call_inflight_inc;
 pub(crate) use inner::tool_call_rejected_overloaded;
 pub(crate) use inner::writer_sink_send_error;
+
+#[cfg(test)]
+pub(crate) use test_hooks::evict_drain_metric_hooks_snapshot_for_tests;
 
 /// Record a harness connection attempt. Public so callers outside
 /// the SDK (e.g. `AgentBuilder::build_harness()` in the agentic sampler)

@@ -1517,26 +1517,31 @@ impl ToolServer {
                         let server = Arc::clone(&server_for_notif);
                         let conn = connection_for_notif.clone();
                         tokio::spawn(async move {
-                            // Ack first (best-effort) so the server's request
-                            // resolves promptly; the drain runs in the background.
-                            if let Some(id) = request_id {
-                                let response = serde_json::json!({
-                                    "jsonrpc": "2.0",
-                                    "id": id,
-                                    "result": {}
-                                });
-                                if let Ok(text) = serde_json::to_string(&response)
-                                    && let Err(e) = conn.send_outbound(text).await
-                                {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "failed to send tool_server.evict ack"
-                                    );
-                                }
-                            }
-                            for handler in server.handlers_for_session(&evict.session_id) {
-                                handler.handle_evict(evict.clone()).await;
-                            }
+                            let handlers = server.handlers_for_session(&evict.session_id);
+                            let _ = run_evict_drain_task(
+                                || async {
+                                    // Ack first (best-effort) so the server's request
+                                    // resolves promptly; the drain runs in the background.
+                                    if let Some(id) = request_id {
+                                        let response = serde_json::json!({
+                                            "jsonrpc": "2.0",
+                                            "id": id,
+                                            "result": {}
+                                        });
+                                        if let Ok(text) = serde_json::to_string(&response)
+                                            && let Err(e) = conn.send_outbound(text).await
+                                        {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "failed to send tool_server.evict ack"
+                                            );
+                                        }
+                                    }
+                                },
+                                handlers,
+                                evict,
+                            )
+                            .await;
                         });
                     }
                     _ => {}
@@ -1777,6 +1782,77 @@ async fn push_disconnect_status(connection: &HubConnection, sessions: &[SessionI
             debug!(error = %e, session = %sid, "push_disconnect_status failed");
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EvictDrainResult {
+    Completed,
+    TimedOut,
+}
+
+/// Preserve the ack-first behavior while enforcing a shared hard deadline for
+/// the whole evict-drain operation.
+async fn run_evict_drain_task<F, Fut>(
+    ack_first: F,
+    handlers: Vec<Arc<dyn ToolServerHandler>>,
+    evict: ToolServerEvictParams,
+) -> EvictDrainResult
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    ack_first().await;
+    drain_evict_handlers_with_deadline(handlers, evict).await
+}
+
+/// Run `handle_evict` for each handler in order, bounded by a single shared
+/// deadline derived from `evict.grace_period_ms`.
+async fn drain_evict_handlers_with_deadline(
+    handlers: Vec<Arc<dyn ToolServerHandler>>,
+    evict: ToolServerEvictParams,
+) -> EvictDrainResult {
+    let started = tokio::time::Instant::now();
+    let deadline = started + std::time::Duration::from_millis(evict.grace_period_ms);
+
+    for (idx, handler) in handlers.into_iter().enumerate() {
+        let now = tokio::time::Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            warn!(
+                session = %evict.session_id,
+                reason = %evict.reason,
+                grace_period_ms = evict.grace_period_ms,
+                elapsed_ms,
+                handlers_completed = idx,
+                "tool_server.evict drain timed out before all handlers completed"
+            );
+            crate::metrics::evict_drain_timed_out();
+            crate::metrics::evict_drain_duration_observe(started.elapsed().as_secs_f64());
+            return EvictDrainResult::TimedOut;
+        };
+
+        if tokio::time::timeout(remaining, handler.handle_evict(evict.clone()))
+            .await
+            .is_err()
+        {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            warn!(
+                session = %evict.session_id,
+                reason = %evict.reason,
+                grace_period_ms = evict.grace_period_ms,
+                elapsed_ms,
+                handlers_completed = idx,
+                "tool_server.evict drain timed out before all handlers completed"
+            );
+            crate::metrics::evict_drain_timed_out();
+            crate::metrics::evict_drain_duration_observe(started.elapsed().as_secs_f64());
+            return EvictDrainResult::TimedOut;
+        }
+    }
+
+    crate::metrics::evict_drain_completed();
+    crate::metrics::evict_drain_duration_observe(started.elapsed().as_secs_f64());
+    EvictDrainResult::Completed
 }
 
 /// Per-session inbound dispatcher.
@@ -2336,7 +2412,200 @@ async fn send_overloaded(connection: &Arc<HubConnection>, id: JsonRpcId, session
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use xai_tool_runtime::ContentBlock;
+
+    #[derive(Debug)]
+    struct EvictTestHandler {
+        name: &'static str,
+        sleep_ms: u64,
+        started: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        completed: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ToolServerHandler for EvictTestHandler {
+        fn tool_id(&self) -> ToolId {
+            ToolId::new(format!("evict_test_{}", self.name)).expect("valid tool id")
+        }
+
+        fn description(&self) -> ToolDescription {
+            ToolDescription::new(self.name, "evict test handler")
+        }
+
+        async fn handle_call(
+            &self,
+            _ctx: ToolCallContext,
+            _args: Value,
+        ) -> ToolStream<TypedToolOutput> {
+            panic!("unused in evict tests")
+        }
+
+        async fn handle_evict(&self, _params: ToolServerEvictParams) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.lock().expect("started lock").push(self.name);
+            tokio::time::sleep(std::time::Duration::from_millis(self.sleep_ms)).await;
+            self.completed.lock().expect("completed lock").push(self.name);
+        }
+    }
+
+    fn evict_params(grace_period_ms: u64) -> ToolServerEvictParams {
+        ToolServerEvictParams {
+            session_id: SessionId::new("evict-test-session").expect("valid session"),
+            reason: "test".to_owned(),
+            grace_period_ms,
+        }
+    }
+
+    fn evict_handler(
+        name: &'static str,
+        sleep_ms: u64,
+        started: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        completed: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        calls: Arc<AtomicUsize>,
+    ) -> Arc<dyn ToolServerHandler> {
+        Arc::new(EvictTestHandler {
+            name,
+            sleep_ms,
+            started,
+            completed,
+            calls,
+        })
+    }
+
+    #[tokio::test]
+    async fn evict_handler_completing_before_deadline_succeeds_normally() {
+        let before = crate::metrics::evict_drain_metric_hooks_snapshot_for_tests();
+        let started = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let completed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handlers = vec![evict_handler(
+            "h1",
+            10,
+            started.clone(),
+            completed.clone(),
+            calls.clone(),
+        )];
+
+        let out = drain_evict_handlers_with_deadline(handlers, evict_params(120)).await;
+        assert_eq!(out, EvictDrainResult::Completed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*started.lock().expect("started lock"), vec!["h1"]);
+        assert_eq!(*completed.lock().expect("completed lock"), vec!["h1"]);
+        let after = crate::metrics::evict_drain_metric_hooks_snapshot_for_tests();
+        assert!(after.completed >= before.completed + 1);
+        assert!(after.duration_observations >= before.duration_observations + 1);
+    }
+
+    #[tokio::test]
+    async fn evict_handler_exceeding_deadline_returns_within_bounded_grace_window() {
+        let before = crate::metrics::evict_drain_metric_hooks_snapshot_for_tests();
+        let started = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let completed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handlers = vec![evict_handler(
+            "slow",
+            180,
+            started,
+            completed,
+            calls.clone(),
+        )];
+
+        let t0 = tokio::time::Instant::now();
+        let out = drain_evict_handlers_with_deadline(handlers, evict_params(40)).await;
+        let elapsed = t0.elapsed();
+        assert_eq!(out, EvictDrainResult::TimedOut);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(35)
+                && elapsed <= std::time::Duration::from_millis(120),
+            "elapsed={elapsed:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let after = crate::metrics::evict_drain_metric_hooks_snapshot_for_tests();
+        assert!(after.timed_out >= before.timed_out + 1);
+        assert!(after.duration_observations >= before.duration_observations + 1);
+    }
+
+    #[tokio::test]
+    async fn evict_multiple_handlers_share_one_deadline_not_one_per_handler() {
+        let started = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let completed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handlers = vec![
+            evict_handler("h1", 20, started.clone(), completed.clone(), calls.clone()),
+            evict_handler("h2", 60, started.clone(), completed.clone(), calls.clone()),
+        ];
+
+        let t0 = tokio::time::Instant::now();
+        let out = drain_evict_handlers_with_deadline(handlers, evict_params(70)).await;
+        let elapsed = t0.elapsed();
+
+        assert_eq!(out, EvictDrainResult::TimedOut);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "second handler should start");
+        assert_eq!(*started.lock().expect("started lock"), vec!["h1", "h2"]);
+        assert_eq!(*completed.lock().expect("completed lock"), vec!["h1"]);
+        assert!(
+            elapsed <= std::time::Duration::from_millis(130),
+            "shared deadline should prevent giving h2 a fresh full grace period; elapsed={elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_ack_remains_immediate_when_handler_is_slow() {
+        let started = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let completed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handlers = vec![evict_handler(
+            "slow",
+            120,
+            started,
+            completed,
+            calls,
+        )];
+        let acked = Arc::new(AtomicBool::new(false));
+        let acked_for_closure = acked.clone();
+        let acked_for_check = acked.clone();
+        let out = run_evict_drain_task(
+            move || {
+                let acked_for_closure = acked_for_closure.clone();
+                async move {
+                    acked_for_closure.store(true, Ordering::SeqCst);
+                }
+            },
+            handlers,
+            evict_params(30),
+        )
+        .await;
+
+        assert!(acked_for_check.load(Ordering::SeqCst));
+        assert_eq!(out, EvictDrainResult::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn evict_completion_and_timeout_metric_hooks_are_invoked() {
+        let before = crate::metrics::evict_drain_metric_hooks_snapshot_for_tests();
+        let started = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let completed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let completed_handlers = vec![evict_handler(
+            "ok",
+            5,
+            started.clone(),
+            completed.clone(),
+            calls.clone(),
+        )];
+        let _ = drain_evict_handlers_with_deadline(completed_handlers, evict_params(100)).await;
+
+        let timeout_handlers = vec![evict_handler("slow", 100, started, completed, calls)];
+        let _ = drain_evict_handlers_with_deadline(timeout_handlers, evict_params(20)).await;
+
+        let after = crate::metrics::evict_drain_metric_hooks_snapshot_for_tests();
+        assert!(after.completed >= before.completed + 1);
+        assert!(after.timed_out >= before.timed_out + 1);
+        assert!(after.duration_observations >= before.duration_observations + 2);
+    }
 
     fn call_id() -> ToolCallId {
         ToolCallId::new_v7()
