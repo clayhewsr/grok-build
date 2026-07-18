@@ -6,6 +6,7 @@
 //! response is mapped back to [`ToolOutputWire`].
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -16,6 +17,12 @@ use xai_tool_types::ToolDescription;
 
 use crate::transport::McpTransport;
 use crate::types::{McpCallResult, McpContent, McpError, McpServerInfo, McpToolDefinition};
+
+/// Hard backstop for a single MCP `tools/call` round-trip through the adapter.
+///
+/// Private and intentionally not configurable in this layer: it bounds a hung
+/// MCP server/tool invocation without changing the transport or hub APIs.
+const MCP_TOOL_CALL_BACKSTOP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Configuration for an [`McpBridge`] instance.
 #[derive(Debug, Clone)]
@@ -233,14 +240,16 @@ impl xai_computer_hub_sdk::ToolServerHandler for McpToolHandler {
     async fn handle_call(&self, _ctx: ToolCallContext, args: Value) -> ToolStream<TypedToolOutput> {
         let _start = std::time::Instant::now();
         let tool_id = self.tool_id.clone();
-        let result = self
-            .transport
-            .call_tool(self.definition.name.as_str(), args)
-            .await;
+        let result = tokio::time::timeout(
+            MCP_TOOL_CALL_BACKSTOP_TIMEOUT,
+            self.transport
+                .call_tool(self.definition.name.as_str(), args),
+        )
+        .await;
         crate::metrics::mcp_call_duration_observe(_start.elapsed().as_secs_f64());
 
         let terminal = match result {
-            Ok(call_result) => {
+            Ok(Ok(call_result)) => {
                 let output = translate_mcp_result(&call_result);
                 serde_json::to_value(output)
                     .map(|value| TypedToolOutput::from_value(tool_id, value))
@@ -249,11 +258,21 @@ impl xai_computer_hub_sdk::ToolServerHandler for McpToolHandler {
                         ToolError::execution(self.tool_id.clone(), e.to_string()).with_source(e)
                     })
             }
-            Err(mcp_err) => {
+            Ok(Err(mcp_err)) => {
                 crate::metrics::mcp_error();
                 Err(ToolError::execution(
                     self.tool_id.clone(),
                     format!("{mcp_err}"),
+                ))
+            }
+            Err(_elapsed) => {
+                crate::metrics::mcp_call_timed_out();
+                Err(ToolError::timeout(
+                    self.tool_id.clone(),
+                    format!(
+                        "MCP tool call timed out after {:?}",
+                        MCP_TOOL_CALL_BACKSTOP_TIMEOUT
+                    ),
                 ))
             }
         };
@@ -331,8 +350,26 @@ fn translate_mcp_result(result: &McpCallResult) -> ToolOutputWire {
 mod tests {
     use super::*;
     use crate::types::{McpCallResult, McpContent, McpServerInfo, McpToolDefinition};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::future::pending;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Mutex;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CallBehavior {
+        ImmediateOk,
+        ImmediateErr,
+        Hang,
+    }
+
+    struct ActiveCallGuard {
+        active_calls: Arc<AtomicUsize>,
+    }
+
+    impl Drop for ActiveCallGuard {
+        fn drop(&mut self) {
+            self.active_calls.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 
     struct MockTransport {
         server_info: McpServerInfo,
@@ -341,6 +378,8 @@ mod tests {
         call_error: Mutex<Option<McpError>>,
         closed: AtomicBool,
         last_call: Mutex<Option<(String, Value)>>,
+        call_behavior: CallBehavior,
+        active_calls: Arc<AtomicUsize>,
     }
 
     impl MockTransport {
@@ -352,6 +391,8 @@ mod tests {
                 call_error: Mutex::new(None),
                 closed: AtomicBool::new(false),
                 last_call: Mutex::new(None),
+                call_behavior: CallBehavior::ImmediateOk,
+                active_calls: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -365,8 +406,20 @@ mod tests {
         fn with_call_error(self, error: McpError) -> Self {
             Self {
                 call_error: Mutex::new(Some(error)),
+                call_behavior: CallBehavior::ImmediateErr,
                 ..self
             }
+        }
+
+        fn with_hung_call(self) -> Self {
+            Self {
+                call_behavior: CallBehavior::Hang,
+                ..self
+            }
+        }
+
+        fn active_calls(&self) -> Arc<AtomicUsize> {
+            self.active_calls.clone()
         }
     }
 
@@ -382,15 +435,30 @@ mod tests {
 
         async fn call_tool(&self, name: &str, arguments: Value) -> Result<McpCallResult, McpError> {
             *self.last_call.lock().await = Some((name.to_string(), arguments));
+            self.active_calls.fetch_add(1, Ordering::SeqCst);
+            let _guard = ActiveCallGuard {
+                active_calls: self.active_calls.clone(),
+            };
 
-            if let Some(err) = self.call_error.lock().await.take() {
-                return Err(err);
+            match self.call_behavior {
+                CallBehavior::ImmediateOk => self
+                    .call_response
+                    .lock()
+                    .await
+                    .clone()
+                    .ok_or_else(|| McpError::Transport("no canned response".into())),
+                CallBehavior::ImmediateErr => {
+                    if let Some(err) = self.call_error.lock().await.take() {
+                        Err(err)
+                    } else {
+                        Err(McpError::Transport("no canned error".into()))
+                    }
+                }
+                CallBehavior::Hang => {
+                    pending::<()>().await;
+                    unreachable!("hung call future should be cancelled by timeout")
+                }
             }
-            self.call_response
-                .lock()
-                .await
-                .clone()
-                .ok_or_else(|| McpError::Transport("no canned response".into()))
         }
 
         async fn close(&self) -> Result<(), McpError> {
@@ -427,6 +495,18 @@ mod tests {
 
     fn make_transport(mock: MockTransport) -> Arc<dyn McpTransport> {
         Arc::new(mock) as Arc<dyn McpTransport>
+    }
+
+    async fn collect_terminal(
+        handler: &Arc<McpToolHandler>,
+        args: Value,
+    ) -> xai_tool_runtime::ToolStreamItem<TypedToolOutput> {
+        use futures::StreamExt;
+        use xai_computer_hub_sdk::ToolServerHandler;
+
+        let ctx = ToolCallContext::default();
+        let mut stream = handler.handle_call(ctx, args).await;
+        stream.next().await.expect("terminal item")
     }
 
     #[tokio::test]
@@ -642,6 +722,183 @@ mod tests {
                 );
             }
             other => panic!("expected Terminal(Err(Execution)), got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bridge_call_timeout_returns_within_bounded_test_window() {
+        let mock =
+            Arc::new(MockTransport::new(sample_server_info(), sample_tools()).with_hung_call());
+        let active_calls = mock.active_calls();
+        let transport: Arc<dyn McpTransport> = mock.clone();
+        let config = McpBridgeConfig {
+            session_id: SessionId::new("test-session").unwrap(),
+            namespace: None,
+        };
+
+        let handle = McpBridge::connect(transport, &config).await.unwrap();
+        let handler = handle.bridge.handlers()[0].clone();
+
+        let task = tokio::spawn(async move { collect_terminal(&handler, Value::Null).await });
+        tokio::task::yield_now().await;
+        assert_eq!(active_calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(MCP_TOOL_CALL_BACKSTOP_TIMEOUT - Duration::from_secs(1)).await;
+        assert!(
+            !task.is_finished(),
+            "call must still be pending before timeout"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        let item = task.await.expect("join timeout task");
+        match item {
+            xai_tool_runtime::ToolStreamItem::Terminal(Err(ref e)) => {
+                assert_eq!(e.kind, xai_tool_runtime::ToolErrorKind::Timeout);
+            }
+            other => panic!("expected Terminal(Err(Timeout)), got {other:?}"),
+        }
+        assert_eq!(active_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bridge_call_timeout_uses_safe_timeout_message_and_classification() {
+        crate::metrics::reset_mcp_timeout_metric_hooks_for_tests();
+        let transport = make_transport(
+            MockTransport::new(sample_server_info(), sample_tools()).with_hung_call(),
+        );
+        let config = McpBridgeConfig {
+            session_id: SessionId::new("test-session").unwrap(),
+            namespace: None,
+        };
+
+        let handle = McpBridge::connect(transport, &config).await.unwrap();
+        let handler = handle.bridge.handlers()[0].clone();
+
+        let task = tokio::spawn(async move { collect_terminal(&handler, Value::Null).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(MCP_TOOL_CALL_BACKSTOP_TIMEOUT).await;
+
+        let item = task.await.expect("join timeout task");
+        match item {
+            xai_tool_runtime::ToolStreamItem::Terminal(Err(ref e)) => {
+                assert_eq!(e.kind, xai_tool_runtime::ToolErrorKind::Timeout);
+                assert!(e.detail.contains("MCP tool call timed out"));
+                assert!(!e.detail.contains("test-token"));
+                assert!(!e.detail.contains("query"));
+            }
+            other => panic!("expected Terminal(Err(Timeout)), got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bridge_timeout_metric_increments_exactly_once() {
+        crate::metrics::reset_mcp_timeout_metric_hooks_for_tests();
+        let before = crate::metrics::mcp_timeout_metric_hooks_snapshot_for_tests();
+        let transport = make_transport(
+            MockTransport::new(sample_server_info(), sample_tools()).with_hung_call(),
+        );
+        let config = McpBridgeConfig {
+            session_id: SessionId::new("test-session").unwrap(),
+            namespace: None,
+        };
+
+        let handle = McpBridge::connect(transport, &config).await.unwrap();
+        let handler = handle.bridge.handlers()[0].clone();
+        let task = tokio::spawn(async move { collect_terminal(&handler, Value::Null).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(MCP_TOOL_CALL_BACKSTOP_TIMEOUT).await;
+        let _ = task.await.expect("join timeout task");
+
+        let after = crate::metrics::mcp_timeout_metric_hooks_snapshot_for_tests();
+        assert_eq!(after.timeouts, before.timeouts + 1);
+    }
+
+    #[tokio::test]
+    async fn bridge_non_timeout_transport_error_keeps_existing_mapping() {
+        crate::metrics::reset_mcp_timeout_metric_hooks_for_tests();
+        let before = crate::metrics::mcp_timeout_metric_hooks_snapshot_for_tests();
+        let transport = make_transport(
+            MockTransport::new(sample_server_info(), sample_tools())
+                .with_call_error(McpError::Transport("connection reset".into())),
+        );
+        let config = McpBridgeConfig {
+            session_id: SessionId::new("test-session").unwrap(),
+            namespace: None,
+        };
+
+        let handle = McpBridge::connect(transport, &config).await.unwrap();
+        let handler = handle.bridge.handlers()[0].clone();
+        let item = collect_terminal(&handler, Value::Null).await;
+        match item {
+            xai_tool_runtime::ToolStreamItem::Terminal(Err(ref e)) => {
+                assert_eq!(e.kind, xai_tool_runtime::ToolErrorKind::Execution);
+                assert!(e.detail.contains("connection reset"));
+            }
+            other => panic!("expected Terminal(Err(Execution)), got {other:?}"),
+        }
+        let after = crate::metrics::mcp_timeout_metric_hooks_snapshot_for_tests();
+        assert_eq!(after.timeouts, before.timeouts);
+    }
+
+    #[tokio::test]
+    async fn bridge_success_does_not_increment_timeout_metric() {
+        crate::metrics::reset_mcp_timeout_metric_hooks_for_tests();
+        let before = crate::metrics::mcp_timeout_metric_hooks_snapshot_for_tests();
+        let call_result = McpCallResult {
+            content: vec![McpContent::Text {
+                text: "found 3 results".into(),
+            }],
+            is_error: false,
+        };
+        let transport = make_transport(
+            MockTransport::new(sample_server_info(), sample_tools())
+                .with_call_response(call_result),
+        );
+        let config = McpBridgeConfig {
+            session_id: SessionId::new("test-session").unwrap(),
+            namespace: None,
+        };
+
+        let handle = McpBridge::connect(transport, &config).await.unwrap();
+        let handler = handle.bridge.handlers()[0].clone();
+        let item = collect_terminal(&handler, serde_json::json!({"query": "test"})).await;
+        match item {
+            xai_tool_runtime::ToolStreamItem::Terminal(Ok(typed)) => {
+                let output: ToolOutputWire = serde_json::from_value(typed.value).unwrap();
+                assert_eq!(output, ToolOutputWire::Text("found 3 results".into()));
+            }
+            other => panic!("expected Terminal(Ok(_)), got {other:?}"),
+        }
+        let after = crate::metrics::mcp_timeout_metric_hooks_snapshot_for_tests();
+        assert_eq!(after.timeouts, before.timeouts);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_timeouts_do_not_leave_accumulating_background_work() {
+        crate::metrics::reset_mcp_timeout_metric_hooks_for_tests();
+        let mock =
+            Arc::new(MockTransport::new(sample_server_info(), sample_tools()).with_hung_call());
+        let active_calls = mock.active_calls();
+        let transport: Arc<dyn McpTransport> = mock.clone();
+        let config = McpBridgeConfig {
+            session_id: SessionId::new("test-session").unwrap(),
+            namespace: None,
+        };
+        let handle = McpBridge::connect(transport, &config).await.unwrap();
+
+        for _ in 0..3 {
+            let handler = handle.bridge.handlers()[0].clone();
+            let task = tokio::spawn(async move { collect_terminal(&handler, Value::Null).await });
+            tokio::task::yield_now().await;
+            assert_eq!(active_calls.load(Ordering::SeqCst), 1);
+            tokio::time::advance(MCP_TOOL_CALL_BACKSTOP_TIMEOUT).await;
+            let item = task.await.expect("join repeated timeout task");
+            match item {
+                xai_tool_runtime::ToolStreamItem::Terminal(Err(ref e)) => {
+                    assert_eq!(e.kind, xai_tool_runtime::ToolErrorKind::Timeout);
+                }
+                other => panic!("expected Terminal(Err(Timeout)), got {other:?}"),
+            }
+            assert_eq!(active_calls.load(Ordering::SeqCst), 0);
         }
     }
 
