@@ -57,6 +57,15 @@ mod inner {
         .expect("computer_hub_client_reconnect_duration_seconds must register once")
     });
 
+    static RECONNECT_BACKOFF_DELAY_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+        register_histogram!(
+            "computer_hub_client_reconnect_backoff_delay_seconds",
+            "Chosen reconnect sleep delay per attempt after bounded jitter.",
+            exponential_buckets(0.05, 2.0, 14).expect("valid bucket params")
+        )
+        .expect("computer_hub_client_reconnect_backoff_delay_seconds must register once")
+    });
+
     static RECONNECTS_BY_CAUSE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
         register_int_counter_vec!(
             "computer_hub_client_reconnects_by_cause_total",
@@ -336,6 +345,10 @@ mod inner {
         RECONNECT_DURATION_SECONDS.observe(secs);
     }
 
+    pub(crate) fn reconnect_backoff_delay_observe(secs: f64) {
+        RECONNECT_BACKOFF_DELAY_SECONDS.observe(secs);
+    }
+
     pub(crate) fn reconnect_cause(cause: &str) {
         RECONNECTS_BY_CAUSE_TOTAL.with_label_values(&[cause]).inc();
     }
@@ -477,6 +490,7 @@ mod inner {
     pub(crate) fn reconnect_succeeded() {}
     pub(crate) fn reconnect_failed(_reason: &str) {}
     pub(crate) fn reconnect_duration_observe(_secs: f64) {}
+    pub(crate) fn reconnect_backoff_delay_observe(_secs: f64) {}
     pub(crate) fn reconnect_cause(_cause: &str) {}
     pub(crate) fn reconnect_gap_observe(_secs: f64) {}
     pub(crate) fn call_dispatch_observe(_secs: f64) {}
@@ -531,6 +545,7 @@ pub(crate) use inner::pool_connections_inc;
 pub(crate) use inner::pool_evictions_inc;
 pub(crate) use inner::progress_frame_forwarded;
 pub(crate) use inner::reconnect_cause;
+pub(crate) use inner::reconnect_backoff_delay_observe;
 pub(crate) use inner::reconnect_duration_observe;
 pub(crate) use inner::reconnect_failed;
 pub(crate) use inner::reconnect_gap_observe;

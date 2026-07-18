@@ -37,6 +37,8 @@ use futures::{SinkExt, Stream, StreamExt};
 use http::HeaderName;
 use http::header::HeaderValue;
 use serde_json::Value;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::net::TcpStream;
@@ -59,6 +61,10 @@ const OUTBOUND_BUFFER: usize = 256;
 /// Backoff schedule (in ms) for reconnect attempts. The last value is
 /// reused for any further attempts so the cap is `10s`.
 const RECONNECT_BACKOFF_MS: &[u64] = &[100, 200, 500, 1_000, 2_000, 5_000, 10_000];
+/// Bounded reconnect jitter width applied per-attempt around the selected
+/// backoff slot. A value of `20` means each attempt sleeps in
+/// `[base*0.8, base*1.2]`.
+const RECONNECT_BACKOFF_JITTER_PCT: u64 = 20;
 /// Floor for the per-attempt reconnect budget: a small liveness override
 /// must not shrink it below what a WAN handshake + session replay needs,
 /// or the retry loop would livelock aborting every attempt at the bound.
@@ -1155,9 +1161,20 @@ async fn run_reader_actor(
                 let mut backoff_total = Duration::ZERO;
                 loop {
                     attempt = attempt.saturating_add(1);
-                    let backoff = backoff_for(attempt, &inner.reconnect_backoff);
+                    let base_backoff = backoff_for(attempt, &inner.reconnect_backoff);
+                    let backoff = jittered_backoff(
+                        base_backoff,
+                        attempt,
+                        &inner.key,
+                        reconnect_jitter_entropy(),
+                    );
+                    crate::metrics::reconnect_backoff_delay_observe(backoff.as_secs_f64());
                     info!(
-                        ? backoff, attempt, url = % url, "reconnecting server connection"
+                        ? backoff,
+                        base_backoff_ms = base_backoff.as_millis() as u64,
+                        attempt,
+                        url = % url,
+                        "reconnecting server connection"
                     );
                     tokio::select! {
                         _ = stop_rx.recv() => break 'actor, _ = sleep(backoff) => {}
@@ -1380,6 +1397,46 @@ fn backoff_for(attempt: u32, schedule: &[Duration]) -> Duration {
         .min(schedule.len().saturating_sub(1));
     schedule.get(idx).copied().unwrap_or_default()
 }
+/// Process-local entropy mixed into reconnect jitter so independent clients
+/// do not retry in lockstep after a shared outage.
+fn reconnect_jitter_entropy() -> u64 {
+    static ENTROPY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ENTROPY.get_or_init(|| {
+        let mut hasher = DefaultHasher::new();
+        std::process::id().hash(&mut hasher);
+        std::thread::current().id().hash(&mut hasher);
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .hash(&mut hasher);
+        hasher.finish()
+    })
+}
+/// Apply bounded jitter around `base` for reconnect de-synchronisation while
+/// preserving the same retry schedule shape and cap.
+fn jittered_backoff(base: Duration, attempt: u32, key: &ConnKey, entropy: u64) -> Duration {
+    if base.is_zero() {
+        return Duration::ZERO;
+    }
+    let base_ms = base.as_millis().min(u128::from(u64::MAX)) as u64;
+    let spread = base_ms
+        .saturating_mul(RECONNECT_BACKOFF_JITTER_PCT)
+        .saturating_div(100);
+    if spread == 0 {
+        return Duration::from_millis(base_ms);
+    }
+    let mut hasher = DefaultHasher::new();
+    entropy.hash(&mut hasher);
+    attempt.hash(&mut hasher);
+    key.url.hash(&mut hasher);
+    key.principal.hash(&mut hasher);
+    let r = hasher.finish();
+    let window = spread.saturating_mul(2).saturating_add(1);
+    let offset = (r % window) as i64 - spread as i64;
+    let jittered_ms = (base_ms as i64 + offset).max(1) as u64;
+    Duration::from_millis(jittered_ms)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1433,6 +1490,64 @@ mod tests {
             assert_eq!(backoff_for(7, &schedule), Duration::from_millis(10_000));
             assert_eq!(backoff_for(99, &schedule), Duration::from_millis(10_000));
         }
+    }
+    fn test_conn_key() -> ConnKey {
+        ConnKey {
+            url: "wss://hub.example.com/v1/tools".to_owned(),
+            principal: bearer_credential().principal_key(),
+        }
+    }
+    #[test]
+    fn jittered_backoff_stays_within_bounds() {
+        let schedule = default_reconnect_backoff();
+        let key = test_conn_key();
+        for attempt in 1..=20 {
+            let base = backoff_for(attempt, &schedule);
+            let jittered = jittered_backoff(base, attempt, &key, 12345);
+            let base_ms = base.as_millis() as u64;
+            let spread = base_ms * RECONNECT_BACKOFF_JITTER_PCT / 100;
+            let jittered_ms = jittered.as_millis() as u64;
+            assert!(
+                jittered_ms >= base_ms.saturating_sub(spread)
+                    && jittered_ms <= base_ms.saturating_add(spread),
+                "attempt={attempt} base_ms={base_ms} spread={spread} jittered_ms={jittered_ms}"
+            );
+        }
+    }
+    #[test]
+    fn jittered_backoff_preserves_cap_window() {
+        let schedule = default_reconnect_backoff();
+        let key = test_conn_key();
+        let cap = backoff_for(999, &schedule);
+        let jittered = jittered_backoff(cap, 999, &key, 777);
+        let cap_ms = cap.as_millis() as u64;
+        let spread = cap_ms * RECONNECT_BACKOFF_JITTER_PCT / 100;
+        let jittered_ms = jittered.as_millis() as u64;
+        assert!(jittered_ms >= cap_ms - spread);
+        assert!(jittered_ms <= cap_ms + spread);
+    }
+    #[test]
+    fn jittered_backoff_regression_disperses_clients() {
+        let schedule = default_reconnect_backoff();
+        let key = test_conn_key();
+        let attempt = 4;
+        let base = backoff_for(attempt, &schedule);
+        let mut observed = std::collections::BTreeSet::new();
+        for entropy in 1..=64_u64 {
+            observed.insert(jittered_backoff(base, attempt, &key, entropy));
+        }
+        assert!(
+            observed.len() > 1,
+            "expected reconnect delay spread; saw {observed:?}"
+        );
+    }
+    #[test]
+    fn jittered_backoff_is_deterministic_for_same_inputs() {
+        let key = test_conn_key();
+        let base = Duration::from_millis(1_000);
+        let a = jittered_backoff(base, 3, &key, 42);
+        let b = jittered_backoff(base, 3, &key, 42);
+        assert_eq!(a, b);
     }
     /// A zero or unset ping interval must resolve to the default. A zero
     /// period would otherwise reach `tokio::time::interval`, which panics on
