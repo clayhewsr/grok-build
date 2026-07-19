@@ -14,7 +14,7 @@ use crate::storage_client::{Auth401AttributionCallback, HttpUploadError};
 use crate::{BlobCompression, TraceExportConfig, UploadMethod};
 use anyhow::Context;
 use async_compression::tokio::bufread::ZstdEncoder;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -227,6 +227,80 @@ const INLINE_FALLBACK_TOTAL_PERMITS: u32 =
 fn inline_fallback_permits(size_bytes: u64) -> u32 {
     let units = size_bytes.div_ceil(INLINE_FALLBACK_PERMIT_BYTES);
     units.clamp(1, INLINE_FALLBACK_TOTAL_PERMITS as u64) as u32
+}
+
+type InlineFallbackTaskMap = HashMap<u64, tokio::task::JoinHandle<()>>;
+type InlineFallbackRegistry = HashMap<PathBuf, InlineFallbackTaskMap>;
+
+static INLINE_FALLBACK_TASK_ID: AtomicU64 = AtomicU64::new(1);
+static INLINE_FALLBACK_TASKS: OnceLock<Mutex<InlineFallbackRegistry>> = OnceLock::new();
+
+fn inline_fallback_tasks() -> &'static Mutex<InlineFallbackRegistry> {
+    INLINE_FALLBACK_TASKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_inline_fallback_task(
+    queue_dir: &Path,
+    task_id: u64,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    let mut registry = inline_fallback_tasks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    registry
+        .entry(queue_dir.to_path_buf())
+        .or_default()
+        .insert(task_id, handle);
+}
+
+fn unregister_inline_fallback_task(queue_dir: &Path, task_id: u64) {
+    let mut registry = inline_fallback_tasks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(tasks) = registry.get_mut(queue_dir) {
+        tasks.remove(&task_id);
+        if tasks.is_empty() {
+            registry.remove(queue_dir);
+        }
+    }
+}
+
+fn inline_fallback_task_count(queue_dir: &Path) -> usize {
+    let registry = inline_fallback_tasks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    registry.get(queue_dir).map_or(0, HashMap::len)
+}
+
+async fn abort_inline_fallback_tasks(queue_dir: &Path) -> usize {
+    let mut handles = {
+        let mut registry = inline_fallback_tasks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry
+            .remove(queue_dir)
+            .map(|tasks| tasks.into_values().collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let remaining = handles.len();
+    for handle in &handles {
+        handle.abort();
+    }
+    for handle in handles.drain(..) {
+        let _ = handle.await;
+    }
+    remaining
+}
+
+struct InlineFallbackTaskGuard {
+    queue_dir: PathBuf,
+    task_id: u64,
+}
+
+impl Drop for InlineFallbackTaskGuard {
+    fn drop(&mut self) {
+        unregister_inline_fallback_task(&self.queue_dir, self.task_id);
+    }
 }
 /// A queue-owned temp file the worker uploads then deletes. Both variants are
 /// owned (the queue never holds a caller's working-tree path); they differ only
@@ -1349,46 +1423,110 @@ impl UploadQueue {
         );
         async {
             let current_span = tracing::Span::current();
+            let shutdown_deadline = tokio::time::Instant::now() + deadline;
             let state = self
                 .drain_state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take();
-            let Some(state) = state else {
+            let had_worker = state.is_some();
+            let mut worker_timed_out = false;
+            if let Some(state) = state {
+                let _ = state.shutdown_tx.send(());
+                let handle = state.worker_handle;
+                tokio::pin!(handle);
+                let now = tokio::time::Instant::now();
+                if now >= shutdown_deadline {
+                    worker_timed_out = true;
+                    handle.abort();
+                } else {
+                    let remaining = shutdown_deadline.duration_since(now);
+                    match tokio::time::timeout(remaining, &mut handle).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            let remaining = self.stats.pending.load(Ordering::Relaxed) as usize;
+                            current_span.record("outcome", "panicked");
+                            current_span.record("remaining", remaining);
+                            tracing::warn!(
+                                error = % e, "Upload queue worker panicked during drain"
+                            );
+                            return remaining;
+                        }
+                        Err(_) => {
+                            worker_timed_out = true;
+                            tracing::debug!("Upload queue drain timed out");
+                            handle.abort();
+                        }
+                    }
+                }
+            }
+
+            let fallback_timed_out = self
+                .drain_inline_fallback_tasks_with_deadline(shutdown_deadline)
+                .await;
+            let remaining = self.stats.pending.load(Ordering::Relaxed) as usize;
+            if worker_timed_out || fallback_timed_out {
+                current_span.record("outcome", "timed_out");
+                current_span.record("remaining", remaining);
+                return remaining;
+            }
+            if !had_worker {
                 current_span.record("outcome", "noop");
                 current_span.record("remaining", 0usize);
                 return 0;
-            };
-            let _ = state.shutdown_tx.send(());
-            let handle = state.worker_handle;
-            tokio::pin!(handle);
-            match tokio::time::timeout(deadline, &mut handle).await {
-                Ok(Ok(())) => {
-                    current_span.record("outcome", "completed");
-                    current_span.record("remaining", 0usize);
-                    0
-                }
-                Ok(Err(e)) => {
-                    let remaining = self.stats.pending.load(Ordering::Relaxed) as usize;
-                    current_span.record("outcome", "panicked");
-                    current_span.record("remaining", remaining);
-                    tracing::warn!(
-                        error = % e, "Upload queue worker panicked during drain"
-                    );
-                    remaining
-                }
-                Err(_) => {
-                    let remaining = self.stats.pending.load(Ordering::Relaxed) as usize;
-                    current_span.record("outcome", "timed_out");
-                    current_span.record("remaining", remaining);
-                    tracing::debug!("Upload queue drain timed out");
-                    handle.abort();
-                    remaining
-                }
             }
+            current_span.record("outcome", "completed");
+            current_span.record("remaining", 0usize);
+            0
         }
         .instrument(span)
         .await
+    }
+
+    async fn drain_inline_fallback_tasks_with_deadline(
+        &self,
+        shutdown_deadline: tokio::time::Instant,
+    ) -> bool {
+        loop {
+            if inline_fallback_task_count(&self.queue_dir) == 0 {
+                return false;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= shutdown_deadline {
+                let aborted = abort_inline_fallback_tasks(&self.queue_dir);
+                let aborted = abort_inline_fallback_tasks(&self.queue_dir).await;
+                if aborted > 0 {
+                    tracing::warn!(
+                        aborted,
+                        "aborted inline fallback uploads after shared drain deadline"
+                    );
+                }
+                return aborted > 0;
+            }
+            let slice = shutdown_deadline.min(now + Duration::from_millis(25));
+            tokio::time::sleep_until(slice).await;
+        }
+    }
+
+    fn spawn_tracked_inline_fallback_task(
+        &self,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let queue_dir = self.queue_dir.clone();
+        let task_id = INLINE_FALLBACK_TASK_ID.fetch_add(1, Ordering::Relaxed);
+        let guard = InlineFallbackTaskGuard {
+            queue_dir: queue_dir.clone(),
+            task_id,
+        };
+        let handle = tokio::spawn(async move {
+            let _task_guard = guard;
+            task.await;
+        });
+        let finished = handle.is_finished();
+        register_inline_fallback_task(&queue_dir, task_id, handle);
+        if finished {
+            unregister_inline_fallback_task(&queue_dir, task_id);
+        }
     }
     /// Current queue statistics.
     pub fn stats(&self) -> &UploadQueueStats {
@@ -1474,7 +1612,7 @@ impl UploadQueue {
         let semaphore = self.inline_fallback_semaphore.clone();
         let permits = inline_fallback_permits(original_size);
         let parent_span = tracing::Span::current();
-        tokio::spawn(
+        self.spawn_tracked_inline_fallback_task(
             async move {
                 let _permit = semaphore
                     .acquire_many_owned(permits)
@@ -1526,7 +1664,7 @@ impl UploadQueue {
         let stats = self.stats.clone();
         let permits = inline_fallback_permits(original_size);
         let parent_span = tracing::Span::current();
-        tokio::spawn(
+        self.spawn_tracked_inline_fallback_task(
             async move {
                 let _permit = semaphore
                     .acquire_many_owned(permits)
@@ -1579,7 +1717,7 @@ impl UploadQueue {
         let semaphore = self.inline_fallback_semaphore.clone();
         let permits = inline_fallback_permits(size);
         let parent_span = tracing::Span::current();
-        tokio::spawn(
+        self.spawn_tracked_inline_fallback_task(
             async move {
                 let _permit = semaphore
                     .acquire_many_owned(permits)
@@ -1616,7 +1754,7 @@ impl UploadQueue {
         let gcs_path = gcs_path.to_string();
         let content_type = content_type.to_string();
         let parent_span = tracing::Span::current();
-        tokio::spawn(
+        self.spawn_tracked_inline_fallback_task(
             async move {
                 let _permit = semaphore
                     .acquire_many_owned(permits)
@@ -4874,6 +5012,364 @@ mod tests {
         assert_eq!(queue.drain(Duration::from_secs(1)).await, 0);
         assert_eq!(queue.drain(Duration::from_secs(1)).await, 0);
     }
+
+    #[derive(Clone)]
+    struct InlineFallbackGateResolver {
+        entered: Arc<AtomicU32>,
+        dropped: Arc<AtomicU32>,
+        gate: Arc<tokio::sync::Semaphore>,
+        proxy_base_url: String,
+    }
+
+    impl TraceExportSource for InlineFallbackGateResolver {
+        fn resolve(&self) -> TraceExportConfig {
+            TraceExportConfig {
+                bucket_url: None,
+                service_account_key: None,
+                prefix_dir: None,
+                gcs_prefix: None,
+                absolute_paths: false,
+                archive_name_override: None,
+                upload_method: UploadMethod::Proxy {
+                    proxy_base_url: self.proxy_base_url.clone(),
+                    user_token: "t".to_string(),
+                    deployment_key: None,
+                    alpha_test_key: None,
+                },
+            }
+        }
+
+        fn resolve_async(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TraceExportConfig> + Send + '_>>
+        {
+            struct DropCounter(Arc<AtomicU32>);
+            impl Drop for DropCounter {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            Box::pin(async move {
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                let _drop_counter = DropCounter(self.dropped.clone());
+                let _permit = self.gate.acquire().await;
+                self.resolve()
+            })
+        }
+    }
+
+    async fn spawn_ok_proxy_base_url() -> String {
+        use axum::{Router, body::Body, http::StatusCode, response::IntoResponse, routing::post};
+
+        async fn ok_handler(_body: Body) -> impl IntoResponse {
+            let resp = r#"{"bucket":"b","path":"p","size":1,"content_type":"application/octet-stream","generation":1}"#;
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                resp,
+            )
+        }
+
+        let app = Router::new().route("/v1/storage", post(ok_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{}/v1", addr)
+    }
+
+    async fn wait_for_entered(counter: &Arc<AtomicU32>, target: u32) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while counter.load(Ordering::SeqCst) < target {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "inline fallback task did not reach expected state"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_fallback_success_completes_and_drain_waits() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let entered = Arc::new(AtomicU32::new(0));
+        let dropped = Arc::new(AtomicU32::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let resolver: Arc<dyn TraceExportSource> = Arc::new(InlineFallbackGateResolver {
+            entered: entered.clone(),
+            dropped: dropped.clone(),
+            gate: gate.clone(),
+            proxy_base_url: spawn_ok_proxy_base_url().await,
+        });
+        let queue = UploadQueue::spawn(temp.path(), resolver, UploadRetryPolicy::default())
+            .with_max_queue_bytes(0);
+
+        queue
+            .enqueue(
+                b"payload",
+                "session/turn_0/fallback_waits.json",
+                "application/json",
+                "fallback_waits",
+                "sess-fallback-waits",
+                0,
+            )
+            .await
+            .unwrap();
+        wait_for_entered(&entered, 1).await;
+
+        let queue_for_drain = queue.clone();
+        let drain_task =
+            tokio::spawn(async move { queue_for_drain.drain(Duration::from_secs(3)).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !drain_task.is_finished(),
+            "drain should wait for fallback completion"
+        );
+
+        gate.add_permits(1);
+        let result = tokio::time::timeout(Duration::from_secs(5), drain_task)
+            .await
+            .expect("drain should complete after fallback is released")
+            .expect("drain task should not panic");
+        assert_eq!(result, 0);
+        assert_eq!(inline_fallback_task_count(&queue.queue_dir), 0);
+        assert!(dropped.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn inline_fallback_timeout_aborts_remaining_task() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let entered = Arc::new(AtomicU32::new(0));
+        let dropped = Arc::new(AtomicU32::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let resolver: Arc<dyn TraceExportSource> = Arc::new(InlineFallbackGateResolver {
+            entered: entered.clone(),
+            dropped: dropped.clone(),
+            gate,
+            proxy_base_url: "http://127.0.0.1:1/v1".to_string(),
+        });
+        let queue = UploadQueue::spawn(temp.path(), resolver, UploadRetryPolicy::default())
+            .with_max_queue_bytes(0);
+
+        queue
+            .enqueue(
+                b"payload",
+                "session/turn_0/fallback_timeout.json",
+                "application/json",
+                "fallback_timeout",
+                "sess-fallback-timeout",
+                0,
+            )
+            .await
+            .unwrap();
+        wait_for_entered(&entered, 1).await;
+
+        let _ = queue.drain(Duration::from_millis(100)).await;
+        assert_eq!(inline_fallback_task_count(&queue.queue_dir), 0);
+        assert!(
+            dropped.load(Ordering::SeqCst) >= 1,
+            "timed-out fallback task should be cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_inline_fallbacks_share_one_drain_deadline() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let entered = Arc::new(AtomicU32::new(0));
+        let dropped = Arc::new(AtomicU32::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let resolver: Arc<dyn TraceExportSource> = Arc::new(InlineFallbackGateResolver {
+            entered: entered.clone(),
+            dropped: dropped.clone(),
+            gate,
+            proxy_base_url: "http://127.0.0.1:1/v1".to_string(),
+        });
+        let queue = UploadQueue::spawn(temp.path(), resolver, UploadRetryPolicy::default())
+            .with_max_queue_bytes(0);
+
+        for idx in 0..3 {
+            queue
+                .enqueue(
+                    b"payload",
+                    &format!("session/turn_0/fallback_multi_{idx}.json"),
+                    "application/json",
+                    "fallback_multi",
+                    "sess-fallback-multi",
+                    idx,
+                )
+                .await
+                .unwrap();
+        }
+        wait_for_entered(&entered, 3).await;
+
+        let started = std::time::Instant::now();
+        let _ = queue.drain(Duration::from_millis(120)).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "drain should apply one shared timeout window, not one timeout per fallback"
+        );
+        assert_eq!(inline_fallback_task_count(&queue.queue_dir), 0);
+        assert!(dropped.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[tokio::test]
+    async fn drain_without_fallback_preserves_existing_behavior() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let resolver: Arc<dyn TraceExportSource> = Arc::new(MockResolver);
+        let queue = UploadQueue::spawn(temp.path(), resolver, UploadRetryPolicy::default());
+        assert_eq!(queue.stats().enqueue_fallbacks.load(Ordering::Relaxed), 0);
+        assert_eq!(queue.drain(Duration::from_millis(100)).await, 0);
+        assert_eq!(inline_fallback_task_count(&queue.queue_dir), 0);
+        assert_eq!(queue.stats().enqueue_fallbacks.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn inline_fallback_registry_empty_after_successful_drain() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let resolver: Arc<dyn TraceExportSource> = Arc::new(InlineFallbackGateResolver {
+            entered: Arc::new(AtomicU32::new(0)),
+            dropped: Arc::new(AtomicU32::new(0)),
+            gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            proxy_base_url: spawn_ok_proxy_base_url().await,
+        });
+        let queue = UploadQueue::spawn(temp.path(), resolver, UploadRetryPolicy::default())
+            .with_max_queue_bytes(0);
+
+        queue
+            .enqueue(
+                b"payload",
+                "session/turn_0/fallback_registry_success.json",
+                "application/json",
+                "fallback_registry_success",
+                "sess-fallback-registry-success",
+                0,
+            )
+            .await
+            .unwrap();
+        let _ = queue.drain(Duration::from_secs(3)).await;
+        assert_eq!(inline_fallback_task_count(&queue.queue_dir), 0);
+    }
+
+    #[tokio::test]
+    async fn inline_fallback_registry_empty_after_timeout_drain() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let entered = Arc::new(AtomicU32::new(0));
+        let resolver: Arc<dyn TraceExportSource> = Arc::new(InlineFallbackGateResolver {
+            entered: entered.clone(),
+            dropped: Arc::new(AtomicU32::new(0)),
+            gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            proxy_base_url: "http://127.0.0.1:1/v1".to_string(),
+        });
+        let queue = UploadQueue::spawn(temp.path(), resolver, UploadRetryPolicy::default())
+            .with_max_queue_bytes(0);
+
+        queue
+            .enqueue(
+                b"payload",
+                "session/turn_0/fallback_registry_timeout.json",
+                "application/json",
+                "fallback_registry_timeout",
+                "sess-fallback-registry-timeout",
+                0,
+            )
+            .await
+            .unwrap();
+        wait_for_entered(&entered, 1).await;
+        let _ = queue.drain(Duration::from_millis(100)).await;
+        assert_eq!(inline_fallback_task_count(&queue.queue_dir), 0);
+    }
+
+    #[tokio::test]
+    async fn repeated_drain_cycles_do_not_leak_fallback_handles() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let entered = Arc::new(AtomicU32::new(0));
+        let dropped = Arc::new(AtomicU32::new(0));
+        let resolver: Arc<dyn TraceExportSource> = Arc::new(InlineFallbackGateResolver {
+            entered: entered.clone(),
+            dropped: dropped.clone(),
+            gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            proxy_base_url: "http://127.0.0.1:1/v1".to_string(),
+        });
+        let queue = UploadQueue::spawn(temp.path(), resolver, UploadRetryPolicy::default())
+            .with_max_queue_bytes(0);
+
+        queue
+            .enqueue(
+                b"payload-1",
+                "session/turn_0/repeat_1.json",
+                "application/json",
+                "repeat_1",
+                "sess-repeat",
+                0,
+            )
+            .await
+            .unwrap();
+        wait_for_entered(&entered, 1).await;
+        let _ = queue.drain(Duration::from_millis(100)).await;
+        assert_eq!(inline_fallback_task_count(&queue.queue_dir), 0);
+
+        queue
+            .enqueue(
+                b"payload-2",
+                "session/turn_0/repeat_2.json",
+                "application/json",
+                "repeat_2",
+                "sess-repeat",
+                1,
+            )
+            .await
+            .unwrap();
+        wait_for_entered(&entered, 2).await;
+        let _ = queue.drain(Duration::from_millis(100)).await;
+
+        assert_eq!(inline_fallback_task_count(&queue.queue_dir), 0);
+        assert!(dropped.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn inline_fallback_preserves_existing_upload_statistics() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let resolver: Arc<dyn TraceExportSource> = Arc::new(InlineFallbackGateResolver {
+            entered: Arc::new(AtomicU32::new(0)),
+            dropped: Arc::new(AtomicU32::new(0)),
+            gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            proxy_base_url: spawn_ok_proxy_base_url().await,
+        });
+        let queue = UploadQueue::spawn(temp.path(), resolver, UploadRetryPolicy::default())
+            .with_max_queue_bytes(0);
+        let stats = queue.stats();
+
+        let pending_before = stats.pending.load(Ordering::Relaxed);
+        let pending_bytes_before = stats.pending_bytes.load(Ordering::Relaxed);
+        let fallback_before = stats.enqueue_fallbacks.load(Ordering::Relaxed);
+
+        queue
+            .enqueue(
+                b"payload",
+                "session/turn_0/stats.json",
+                "application/json",
+                "stats",
+                "sess-stats",
+                0,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(stats.pending.load(Ordering::Relaxed), pending_before);
+        assert_eq!(
+            stats.pending_bytes.load(Ordering::Relaxed),
+            pending_bytes_before
+        );
+        assert_eq!(
+            stats.enqueue_fallbacks.load(Ordering::Relaxed),
+            fallback_before + 1
+        );
+
+        let _ = queue.drain(Duration::from_secs(3)).await;
+        assert_eq!(stats.pending.load(Ordering::Relaxed), pending_before);
+        assert_eq!(inline_fallback_task_count(&queue.queue_dir), 0);
+    }
+
     #[tokio::test]
     async fn enqueue_after_drain_falls_back_to_inline() {
         let temp = tempfile::TempDir::new().unwrap();
