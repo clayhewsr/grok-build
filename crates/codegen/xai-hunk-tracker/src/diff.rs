@@ -88,9 +88,12 @@ pub fn generate_hunk_patch(baseline: &str, current: &str, hunk: &Hunk) -> String
     let old_start_idx = hunk.line_info.old_start.saturating_sub(1);
     let new_start_idx = hunk.line_info.new_start.saturating_sub(1);
 
-    // Context before the change
-    let context_before_start = old_start_idx.saturating_sub(CONTEXT_LINES);
-    let context_before_end = old_start_idx;
+    // Context before the change (track old/new independently because later hunks
+    // can have shifted coordinates after prior insertions/deletions).
+    let context_before_start_old = old_start_idx.saturating_sub(CONTEXT_LINES);
+    let context_before_end_old = old_start_idx;
+    let context_before_start_new = new_start_idx.saturating_sub(CONTEXT_LINES);
+    let context_before_end_new = new_start_idx;
 
     // Context after the change (in new file coordinates)
     let changes_end_new = new_start_idx + hunk.line_info.new_count;
@@ -103,16 +106,16 @@ pub fn generate_hunk_patch(baseline: &str, current: &str, hunk: &Hunk) -> String
     let context_after_end_old = (changes_end_old + CONTEXT_LINES).min(old_lines.len());
 
     // Calculate total lines for header
-    let total_old_lines = (context_before_end - context_before_start)
+    let total_old_lines = (context_before_end_old - context_before_start_old)
         + hunk.line_info.old_count
         + (context_after_end_old - context_after_start_old);
-    let total_new_lines = (context_before_end - context_before_start)
+    let total_new_lines = (context_before_end_new - context_before_start_new)
         + hunk.line_info.new_count
         + (context_after_end - context_after_start);
 
     // Hunk header (1-indexed)
-    let header_old_start = context_before_start + 1;
-    let header_new_start = context_before_start + 1; // Context is same in both
+    let header_old_start = context_before_start_old + 1;
+    let header_new_start = context_before_start_new + 1;
 
     let _ = writeln!(
         output,
@@ -121,7 +124,7 @@ pub fn generate_hunk_patch(baseline: &str, current: &str, hunk: &Hunk) -> String
     );
 
     // Context lines before
-    for i in context_before_start..context_before_end {
+    for i in context_before_start_old..context_before_end_old {
         if let Some(line) = old_lines.get(i) {
             let _ = writeln!(output, " {}", line);
         }
@@ -830,6 +833,32 @@ mod tests {
         let delete_patch = generate_hunk_patch(baseline, current, delete_hunk);
         assert!(delete_patch.contains("-line 4"));
         assert!(!delete_patch.contains("+line 4"));
+    }
+
+    #[test]
+    fn test_generate_hunk_patch_uses_new_coordinates_for_shifted_hunk_context() {
+        let baseline = "A\nB\nC\nD\nE\nF\nG\nH\n";
+        let current = "A\nB\nXXX\nC\nD\nYYY\nF\nG\nH\n";
+
+        let hunks = compute_hunks(Path::new("test.rs"), baseline, current, agent_source());
+        assert_eq!(
+            hunks.len(),
+            2,
+            "Should have insertion and replacement hunks"
+        );
+
+        let second_hunk = &hunks[1];
+        assert_eq!(second_hunk.line_info.old_start, 5);
+        assert_eq!(second_hunk.line_info.new_start, 6);
+
+        let patch = generate_hunk_patch(baseline, current, second_hunk);
+
+        // Regression: header must use independent new-file context start.
+        assert!(patch.starts_with("@@ -2,7 +3,7 @@"), "patch was: {patch}");
+
+        // Regression: context-before should include the shifted line in new file,
+        // represented as unchanged context (single leading space).
+        assert!(patch.contains(" XXX\n C\n D\n"), "patch was: {patch}");
     }
 
     #[test]
