@@ -7,12 +7,15 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use std::{collections::hash_map::DefaultHasher, hash::Hash, hash::Hasher};
 
 use async_trait::async_trait;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 use xai_tool_protocol::{McpBlock, SessionId, ToolId, ToolOutputWire};
-use xai_tool_runtime::{ToolCallContext, ToolError, ToolStream, TypedToolOutput, terminal_only};
+use xai_tool_runtime::{
+    Cancellation, ToolCallContext, ToolError, ToolStream, TypedToolOutput, terminal_only,
+};
 use xai_tool_types::ToolDescription;
 
 use crate::transport::McpTransport;
@@ -23,6 +26,128 @@ use crate::types::{McpCallResult, McpContent, McpError, McpServerInfo, McpToolDe
 /// Private and intentionally not configurable in this layer: it bounds a hung
 /// MCP server/tool invocation without changing the transport or hub APIs.
 const MCP_TOOL_CALL_BACKSTOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Small fixed retry budget for MCP tool calls.
+const MCP_TOOL_CALL_MAX_ATTEMPTS: u32 = 3;
+
+/// Base delay for capped exponential backoff between retries.
+const MCP_TOOL_CALL_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+
+/// Cap for exponential backoff between retries.
+const MCP_TOOL_CALL_RETRY_MAX_DELAY: Duration = Duration::from_millis(800);
+
+/// Deterministic jitter magnitude applied to each retry delay.
+const MCP_TOOL_CALL_RETRY_JITTER_PCT: u64 = 20;
+
+#[derive(Clone)]
+enum AttemptFailure {
+    BackstopTimeout,
+    Mcp(McpError),
+}
+
+impl AttemptFailure {
+    fn retry_reason(&self) -> &'static str {
+        match self {
+            Self::BackstopTimeout => "backstop_timeout",
+            Self::Mcp(McpError::TransportPreCall(_)) => "transport_pre_call",
+            Self::Mcp(McpError::Transport(_)) => "transport",
+            Self::Mcp(McpError::Timeout(_)) => "transport_timeout",
+            Self::Mcp(McpError::Protocol { .. }) => "transient_protocol",
+            Self::Mcp(McpError::Decode(_)) => "decode",
+        }
+    }
+
+    fn is_transient(&self) -> bool {
+        match self {
+            Self::BackstopTimeout => true,
+            Self::Mcp(err) => err.is_transient(),
+        }
+    }
+
+    fn happened_before_remote_execution(&self) -> bool {
+        match self {
+            Self::BackstopTimeout => false,
+            Self::Mcp(err) => err.happened_before_remote_execution(),
+        }
+    }
+}
+
+enum RetryDecision {
+    Retry { reason: &'static str },
+    NoRetry { reason: &'static str },
+}
+
+fn classify_retry(failure: &AttemptFailure, retry_safe: bool) -> RetryDecision {
+    if !failure.is_transient() {
+        return RetryDecision::NoRetry {
+            reason: "deterministic_failure",
+        };
+    }
+
+    if retry_safe || failure.happened_before_remote_execution() {
+        return RetryDecision::Retry {
+            reason: failure.retry_reason(),
+        };
+    }
+
+    RetryDecision::NoRetry {
+        reason: "unsafe_non_idempotent",
+    }
+}
+
+fn deterministic_retry_delay(tool_id: &ToolId, attempt: u32) -> Duration {
+    let exp = 1u64 << (attempt.saturating_sub(2)).min(8);
+    let base_ms = MCP_TOOL_CALL_RETRY_BASE_DELAY.as_millis() as u64;
+    let cap_ms = MCP_TOOL_CALL_RETRY_MAX_DELAY.as_millis() as u64;
+    let unclamped = base_ms.saturating_mul(exp);
+    let capped = unclamped.min(cap_ms);
+
+    let mut hasher = DefaultHasher::new();
+    tool_id.as_str().hash(&mut hasher);
+    attempt.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let jitter_span = capped.saturating_mul(MCP_TOOL_CALL_RETRY_JITTER_PCT) / 100;
+    if jitter_span == 0 {
+        return Duration::from_millis(capped);
+    }
+
+    let jitter =
+        (hash % (jitter_span.saturating_mul(2).saturating_add(1))) as i64 - (jitter_span as i64);
+    let jittered = (capped as i64 + jitter).max(0) as u64;
+    Duration::from_millis(jittered)
+}
+
+async fn sleep_with_optional_cancellation(ctx: &ToolCallContext, delay: Duration) -> bool {
+    if let Some(cancel) = ctx.extensions.get::<Cancellation>() {
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => true,
+            _ = cancel.0.cancelled() => false,
+        }
+    } else {
+        tokio::time::sleep(delay).await;
+        true
+    }
+}
+
+fn map_final_failure(tool_id: &ToolId, failure: AttemptFailure) -> ToolError {
+    match failure {
+        AttemptFailure::BackstopTimeout => {
+            crate::metrics::mcp_call_timed_out();
+            ToolError::timeout(
+                tool_id.clone(),
+                format!(
+                    "MCP tool call timed out after {:?}",
+                    MCP_TOOL_CALL_BACKSTOP_TIMEOUT
+                ),
+            )
+        }
+        AttemptFailure::Mcp(mcp_err) => {
+            crate::metrics::mcp_error();
+            ToolError::execution(tool_id.clone(), format!("{mcp_err}"))
+        }
+    }
+}
 
 /// Configuration for an [`McpBridge`] instance.
 #[derive(Debug, Clone)]
@@ -237,45 +362,161 @@ impl xai_computer_hub_sdk::ToolServerHandler for McpToolHandler {
         self.definition.input_schema.clone()
     }
 
-    async fn handle_call(&self, _ctx: ToolCallContext, args: Value) -> ToolStream<TypedToolOutput> {
+    async fn handle_call(&self, ctx: ToolCallContext, args: Value) -> ToolStream<TypedToolOutput> {
         let _start = std::time::Instant::now();
         let tool_id = self.tool_id.clone();
-        let result = tokio::time::timeout(
-            MCP_TOOL_CALL_BACKSTOP_TIMEOUT,
-            self.transport
-                .call_tool(self.definition.name.as_str(), args),
-        )
-        .await;
-        crate::metrics::mcp_call_duration_observe(_start.elapsed().as_secs_f64());
+        let retry_safe = self.definition.is_retry_safe();
+        let mut attempt: u32 = 1;
+        let mut retried = false;
 
-        let terminal = match result {
-            Ok(Ok(call_result)) => {
-                let output = translate_mcp_result(&call_result);
-                serde_json::to_value(output)
-                    .map(|value| TypedToolOutput::from_value(tool_id, value))
-                    .map_err(|e| {
-                        crate::metrics::mcp_error();
-                        ToolError::execution(self.tool_id.clone(), e.to_string()).with_source(e)
-                    })
-            }
-            Ok(Err(mcp_err)) => {
-                crate::metrics::mcp_error();
-                Err(ToolError::execution(
-                    self.tool_id.clone(),
-                    format!("{mcp_err}"),
-                ))
-            }
-            Err(_elapsed) => {
-                crate::metrics::mcp_call_timed_out();
-                Err(ToolError::timeout(
-                    self.tool_id.clone(),
-                    format!(
-                        "MCP tool call timed out after {:?}",
-                        MCP_TOOL_CALL_BACKSTOP_TIMEOUT
-                    ),
-                ))
+        let terminal = loop {
+            let result = tokio::time::timeout(
+                MCP_TOOL_CALL_BACKSTOP_TIMEOUT,
+                self.transport
+                    .call_tool(self.definition.name.as_str(), args.clone()),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(call_result)) => {
+                    if retried {
+                        crate::metrics::mcp_retry_succeeded();
+                    }
+                    info!(
+                        tool_id = %self.tool_id,
+                        attempt,
+                        final_outcome = "success",
+                        retry_safe,
+                        "MCP call completed"
+                    );
+                    break serde_json::to_value(translate_mcp_result(&call_result))
+                        .map(|value| TypedToolOutput::from_value(tool_id.clone(), value))
+                        .map_err(|e| {
+                            crate::metrics::mcp_error();
+                            ToolError::execution(self.tool_id.clone(), e.to_string()).with_source(e)
+                        });
+                }
+                Ok(Err(mcp_err)) => {
+                    let failure = AttemptFailure::Mcp(mcp_err);
+                    match classify_retry(&failure, retry_safe) {
+                        RetryDecision::Retry { reason } if attempt < MCP_TOOL_CALL_MAX_ATTEMPTS => {
+                            let next_attempt = attempt + 1;
+                            let delay = deterministic_retry_delay(&self.tool_id, next_attempt);
+                            crate::metrics::mcp_retry_attempted();
+                            retried = true;
+                            warn!(
+                                tool_id = %self.tool_id,
+                                attempt,
+                                next_attempt,
+                                retry_reason = reason,
+                                backoff_ms = delay.as_millis() as u64,
+                                failure_kind = "mcp",
+                                "Retrying transient MCP call failure"
+                            );
+                            if !sleep_with_optional_cancellation(&ctx, delay).await {
+                                warn!(
+                                    tool_id = %self.tool_id,
+                                    attempt,
+                                    final_outcome = "cancelled_during_backoff",
+                                    "MCP retry sleep cancelled"
+                                );
+                                break Err(ToolError::cancelled(
+                                    self.tool_id.clone(),
+                                    "MCP tool call cancelled during retry backoff",
+                                ));
+                            }
+                            attempt = next_attempt;
+                            continue;
+                        }
+                        RetryDecision::Retry { reason } => {
+                            crate::metrics::mcp_retry_exhausted();
+                            warn!(
+                                tool_id = %self.tool_id,
+                                attempt,
+                                max_attempts = MCP_TOOL_CALL_MAX_ATTEMPTS,
+                                retry_reason = reason,
+                                final_outcome = "retries_exhausted",
+                                "MCP call exhausted retry budget"
+                            );
+                            break Err(map_final_failure(&self.tool_id, failure));
+                        }
+                        RetryDecision::NoRetry { reason } => {
+                            crate::metrics::mcp_non_retryable_failure();
+                            warn!(
+                                tool_id = %self.tool_id,
+                                attempt,
+                                retry_reason = reason,
+                                final_outcome = "non_retryable_failure",
+                                failure_kind = "mcp",
+                                "MCP call failure classified as non-retryable"
+                            );
+                            break Err(map_final_failure(&self.tool_id, failure));
+                        }
+                    }
+                }
+                Err(_elapsed) => {
+                    let failure = AttemptFailure::BackstopTimeout;
+                    match classify_retry(&failure, retry_safe) {
+                        RetryDecision::Retry { reason } if attempt < MCP_TOOL_CALL_MAX_ATTEMPTS => {
+                            let next_attempt = attempt + 1;
+                            let delay = deterministic_retry_delay(&self.tool_id, next_attempt);
+                            crate::metrics::mcp_retry_attempted();
+                            retried = true;
+                            warn!(
+                                tool_id = %self.tool_id,
+                                attempt,
+                                next_attempt,
+                                retry_reason = reason,
+                                backoff_ms = delay.as_millis() as u64,
+                                failure_kind = "backstop_timeout",
+                                "Retrying transient MCP timeout"
+                            );
+                            if !sleep_with_optional_cancellation(&ctx, delay).await {
+                                warn!(
+                                    tool_id = %self.tool_id,
+                                    attempt,
+                                    final_outcome = "cancelled_during_backoff",
+                                    "MCP retry sleep cancelled"
+                                );
+                                break Err(ToolError::cancelled(
+                                    self.tool_id.clone(),
+                                    "MCP tool call cancelled during retry backoff",
+                                ));
+                            }
+                            attempt = next_attempt;
+                            continue;
+                        }
+                        RetryDecision::Retry { reason } => {
+                            crate::metrics::mcp_retry_exhausted();
+                            warn!(
+                                tool_id = %self.tool_id,
+                                attempt,
+                                max_attempts = MCP_TOOL_CALL_MAX_ATTEMPTS,
+                                retry_reason = reason,
+                                final_outcome = "retries_exhausted",
+                                failure_kind = "backstop_timeout",
+                                "MCP timeout exhausted retry budget"
+                            );
+                            break Err(map_final_failure(&self.tool_id, failure));
+                        }
+                        RetryDecision::NoRetry { reason } => {
+                            crate::metrics::mcp_non_retryable_failure();
+                            warn!(
+                                tool_id = %self.tool_id,
+                                attempt,
+                                retry_reason = reason,
+                                final_outcome = "non_retryable_failure",
+                                failure_kind = "backstop_timeout",
+                                "MCP timeout classified as non-retryable"
+                            );
+                            break Err(map_final_failure(&self.tool_id, failure));
+                        }
+                    }
+                }
             }
         };
+
+        crate::metrics::mcp_call_duration_observe(_start.elapsed().as_secs_f64());
 
         terminal_only(terminal)
     }
@@ -350,9 +591,13 @@ fn translate_mcp_result(result: &McpCallResult) -> ToolOutputWire {
 mod tests {
     use super::*;
     use crate::types::{McpCallResult, McpContent, McpServerInfo, McpToolDefinition};
+    use std::collections::VecDeque;
     use std::future::pending;
+    use std::sync::LazyLock;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Mutex;
+
+    static METRIC_HOOK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum CallBehavior {
@@ -376,10 +621,12 @@ mod tests {
         tools: Vec<McpToolDefinition>,
         call_response: Mutex<Option<McpCallResult>>,
         call_error: Mutex<Option<McpError>>,
+        call_sequence: Mutex<VecDeque<Result<McpCallResult, McpError>>>,
         closed: AtomicBool,
         last_call: Mutex<Option<(String, Value)>>,
         call_behavior: CallBehavior,
         active_calls: Arc<AtomicUsize>,
+        call_count: Arc<AtomicUsize>,
     }
 
     impl MockTransport {
@@ -389,10 +636,12 @@ mod tests {
                 tools,
                 call_response: Mutex::new(None),
                 call_error: Mutex::new(None),
+                call_sequence: Mutex::new(VecDeque::new()),
                 closed: AtomicBool::new(false),
                 last_call: Mutex::new(None),
                 call_behavior: CallBehavior::ImmediateOk,
                 active_calls: Arc::new(AtomicUsize::new(0)),
+                call_count: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -418,8 +667,19 @@ mod tests {
             }
         }
 
+        fn with_call_sequence(self, steps: Vec<Result<McpCallResult, McpError>>) -> Self {
+            Self {
+                call_sequence: Mutex::new(VecDeque::from(steps)),
+                ..self
+            }
+        }
+
         fn active_calls(&self) -> Arc<AtomicUsize> {
             self.active_calls.clone()
+        }
+
+        fn call_count(&self) -> Arc<AtomicUsize> {
+            self.call_count.clone()
         }
     }
 
@@ -435,10 +695,15 @@ mod tests {
 
         async fn call_tool(&self, name: &str, arguments: Value) -> Result<McpCallResult, McpError> {
             *self.last_call.lock().await = Some((name.to_string(), arguments));
+            self.call_count.fetch_add(1, Ordering::SeqCst);
             self.active_calls.fetch_add(1, Ordering::SeqCst);
             let _guard = ActiveCallGuard {
                 active_calls: self.active_calls.clone(),
             };
+
+            if let Some(step) = self.call_sequence.lock().await.pop_front() {
+                return step;
+            }
 
             match self.call_behavior {
                 CallBehavior::ImmediateOk => self
@@ -476,13 +741,18 @@ mod tests {
     }
 
     fn sample_tools() -> Vec<McpToolDefinition> {
+        sample_tools_with_retry_safe(false)
+    }
+
+    fn sample_tools_with_retry_safe(retry_safe: bool) -> Vec<McpToolDefinition> {
         vec![
             McpToolDefinition {
                 name: "search".into(),
                 description: Some("Search for items".into()),
                 input_schema: Some(serde_json::json!({
                     "type": "object",
-                    "properties": { "query": { "type": "string" } }
+                    "properties": { "query": { "type": "string" } },
+                    "x-retry-safe": retry_safe
                 })),
             },
             McpToolDefinition {
@@ -501,10 +771,17 @@ mod tests {
         handler: &Arc<McpToolHandler>,
         args: Value,
     ) -> xai_tool_runtime::ToolStreamItem<TypedToolOutput> {
+        collect_terminal_with_ctx(handler, ToolCallContext::default(), args).await
+    }
+
+    async fn collect_terminal_with_ctx(
+        handler: &Arc<McpToolHandler>,
+        ctx: ToolCallContext,
+        args: Value,
+    ) -> xai_tool_runtime::ToolStreamItem<TypedToolOutput> {
         use futures::StreamExt;
         use xai_computer_hub_sdk::ToolServerHandler;
 
-        let ctx = ToolCallContext::default();
         let mut stream = handler.handle_call(ctx, args).await;
         stream.next().await.expect("terminal item")
     }
@@ -725,6 +1002,245 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn bridge_retries_and_succeeds_on_transient_retry_safe_failure() {
+        let _metric_lock = METRIC_HOOK_LOCK.lock().await;
+        crate::metrics::reset_mcp_timeout_metric_hooks_for_tests();
+        let before = crate::metrics::mcp_timeout_metric_hooks_snapshot_for_tests();
+
+        let call_count = {
+            let mock = Arc::new(
+                MockTransport::new(sample_server_info(), sample_tools_with_retry_safe(true))
+                    .with_call_sequence(vec![
+                        Err(McpError::Transport("connection reset".into())),
+                        Ok(McpCallResult {
+                            content: vec![McpContent::Text {
+                                text: "ok after retry".into(),
+                            }],
+                            is_error: false,
+                        }),
+                    ]),
+            );
+            let call_count = mock.call_count();
+            let transport: Arc<dyn McpTransport> = mock;
+            let config = McpBridgeConfig {
+                session_id: SessionId::new("test-session").unwrap(),
+                namespace: None,
+            };
+            let handle = McpBridge::connect(transport, &config).await.unwrap();
+            let item = collect_terminal(&handle.bridge.handlers()[0], Value::Null).await;
+            match item {
+                xai_tool_runtime::ToolStreamItem::Terminal(Ok(typed)) => {
+                    let output: ToolOutputWire = serde_json::from_value(typed.value).unwrap();
+                    assert_eq!(output, ToolOutputWire::Text("ok after retry".into()));
+                }
+                other => panic!("expected Terminal(Ok(_)), got {other:?}"),
+            }
+            call_count
+        };
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        let after = crate::metrics::mcp_timeout_metric_hooks_snapshot_for_tests();
+        assert!(after.retries_attempted >= before.retries_attempted + 1);
+        assert!(after.retries_succeeded >= before.retries_succeeded + 1);
+    }
+
+    #[tokio::test]
+    async fn bridge_respects_retry_max_attempt_cap() {
+        let _metric_lock = METRIC_HOOK_LOCK.lock().await;
+        crate::metrics::reset_mcp_timeout_metric_hooks_for_tests();
+        let before = crate::metrics::mcp_timeout_metric_hooks_snapshot_for_tests();
+
+        let mock = Arc::new(
+            MockTransport::new(sample_server_info(), sample_tools_with_retry_safe(true))
+                .with_call_sequence(vec![
+                    Err(McpError::Transport("connection reset #1".into())),
+                    Err(McpError::Transport("connection reset #2".into())),
+                    Err(McpError::Transport("connection reset #3".into())),
+                ]),
+        );
+        let call_count = mock.call_count();
+        let transport: Arc<dyn McpTransport> = mock;
+        let config = McpBridgeConfig {
+            session_id: SessionId::new("test-session").unwrap(),
+            namespace: None,
+        };
+        let handle = McpBridge::connect(transport, &config).await.unwrap();
+        let item = collect_terminal(&handle.bridge.handlers()[0], Value::Null).await;
+
+        match item {
+            xai_tool_runtime::ToolStreamItem::Terminal(Err(ref e)) => {
+                assert_eq!(e.kind, xai_tool_runtime::ToolErrorKind::Execution);
+                assert!(e.detail.contains("connection reset #3"));
+            }
+            other => panic!("expected Terminal(Err(Execution)), got {other:?}"),
+        }
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            MCP_TOOL_CALL_MAX_ATTEMPTS as usize
+        );
+
+        let after = crate::metrics::mcp_timeout_metric_hooks_snapshot_for_tests();
+        assert!(
+            after.retries_attempted
+                >= before.retries_attempted + (MCP_TOOL_CALL_MAX_ATTEMPTS as u64 - 1)
+        );
+        assert!(after.retries_exhausted >= before.retries_exhausted + 1);
+    }
+
+    #[tokio::test]
+    async fn bridge_does_not_retry_deterministic_protocol_errors() {
+        let _metric_lock = METRIC_HOOK_LOCK.lock().await;
+        crate::metrics::reset_mcp_timeout_metric_hooks_for_tests();
+        let before = crate::metrics::mcp_timeout_metric_hooks_snapshot_for_tests();
+
+        let mock = Arc::new(
+            MockTransport::new(sample_server_info(), sample_tools_with_retry_safe(true))
+                .with_call_sequence(vec![
+                    Err(McpError::Protocol {
+                        code: 400,
+                        message: "bad request".into(),
+                    }),
+                    Ok(McpCallResult {
+                        content: vec![McpContent::Text {
+                            text: "should not be reached".into(),
+                        }],
+                        is_error: false,
+                    }),
+                ]),
+        );
+        let call_count = mock.call_count();
+        let transport: Arc<dyn McpTransport> = mock;
+        let config = McpBridgeConfig {
+            session_id: SessionId::new("test-session").unwrap(),
+            namespace: None,
+        };
+        let handle = McpBridge::connect(transport, &config).await.unwrap();
+        let item = collect_terminal(&handle.bridge.handlers()[0], Value::Null).await;
+
+        match item {
+            xai_tool_runtime::ToolStreamItem::Terminal(Err(ref e)) => {
+                assert_eq!(e.kind, xai_tool_runtime::ToolErrorKind::Execution);
+                assert!(e.detail.contains("bad request"));
+            }
+            other => panic!("expected Terminal(Err(Execution)), got {other:?}"),
+        }
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+        let after = crate::metrics::mcp_timeout_metric_hooks_snapshot_for_tests();
+        assert!(after.non_retryable_failures >= before.non_retryable_failures + 1);
+    }
+
+    #[tokio::test]
+    async fn bridge_retry_safe_gates_ambiguous_transport_retries() {
+        // Unsafe tool: ambiguous transport error should not retry.
+        let unsafe_mock = Arc::new(
+            MockTransport::new(sample_server_info(), sample_tools_with_retry_safe(false))
+                .with_call_sequence(vec![
+                    Err(McpError::Transport("connection reset".into())),
+                    Ok(McpCallResult {
+                        content: vec![McpContent::Text {
+                            text: "should not be reached".into(),
+                        }],
+                        is_error: false,
+                    }),
+                ]),
+        );
+        let unsafe_calls = unsafe_mock.call_count();
+        let unsafe_transport: Arc<dyn McpTransport> = unsafe_mock;
+        let unsafe_handle = McpBridge::connect(
+            unsafe_transport,
+            &McpBridgeConfig {
+                session_id: SessionId::new("test-session").unwrap(),
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let unsafe_item = collect_terminal(&unsafe_handle.bridge.handlers()[0], Value::Null).await;
+        match unsafe_item {
+            xai_tool_runtime::ToolStreamItem::Terminal(Err(ref e)) => {
+                assert_eq!(e.kind, xai_tool_runtime::ToolErrorKind::Execution);
+            }
+            other => panic!("expected Terminal(Err(Execution)), got {other:?}"),
+        }
+        assert_eq!(unsafe_calls.load(Ordering::SeqCst), 1);
+
+        // Safe tool: same error can retry and succeed.
+        let safe_mock = Arc::new(
+            MockTransport::new(sample_server_info(), sample_tools_with_retry_safe(true))
+                .with_call_sequence(vec![
+                    Err(McpError::Transport("connection reset".into())),
+                    Ok(McpCallResult {
+                        content: vec![McpContent::Text {
+                            text: "safe retry worked".into(),
+                        }],
+                        is_error: false,
+                    }),
+                ]),
+        );
+        let safe_calls = safe_mock.call_count();
+        let safe_transport: Arc<dyn McpTransport> = safe_mock;
+        let safe_handle = McpBridge::connect(
+            safe_transport,
+            &McpBridgeConfig {
+                session_id: SessionId::new("test-session").unwrap(),
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let safe_item = collect_terminal(&safe_handle.bridge.handlers()[0], Value::Null).await;
+        match safe_item {
+            xai_tool_runtime::ToolStreamItem::Terminal(Ok(typed)) => {
+                let output: ToolOutputWire = serde_json::from_value(typed.value).unwrap();
+                assert_eq!(output, ToolOutputWire::Text("safe retry worked".into()));
+            }
+            other => panic!("expected Terminal(Ok(_)), got {other:?}"),
+        }
+        assert_eq!(safe_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bridge_cancels_during_retry_backoff() {
+        let mock = Arc::new(
+            MockTransport::new(sample_server_info(), sample_tools_with_retry_safe(true))
+                .with_call_sequence(vec![Err(McpError::TransportPreCall(
+                    "connect failed".into(),
+                ))]),
+        );
+        let call_count = mock.call_count();
+        let transport: Arc<dyn McpTransport> = mock;
+        let config = McpBridgeConfig {
+            session_id: SessionId::new("test-session").unwrap(),
+            namespace: None,
+        };
+        let handle = McpBridge::connect(transport, &config).await.unwrap();
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut ctx = ToolCallContext::default();
+        ctx.insert(xai_tool_runtime::Cancellation(cancel.clone()));
+
+        let handler = handle.bridge.handlers()[0].clone();
+        let task =
+            tokio::spawn(
+                async move { collect_terminal_with_ctx(&handler, ctx, Value::Null).await },
+            );
+        tokio::task::yield_now().await;
+        cancel.cancel();
+
+        let item = task.await.expect("join cancellation task");
+        match item {
+            xai_tool_runtime::ToolStreamItem::Terminal(Err(ref e)) => {
+                assert_eq!(e.kind, xai_tool_runtime::ToolErrorKind::Cancelled);
+            }
+            other => panic!("expected Terminal(Err(Cancelled)), got {other:?}"),
+        }
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn bridge_call_timeout_returns_within_bounded_test_window() {
         let mock =
@@ -761,6 +1277,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn bridge_call_timeout_uses_safe_timeout_message_and_classification() {
+        let _metric_lock = METRIC_HOOK_LOCK.lock().await;
         crate::metrics::reset_mcp_timeout_metric_hooks_for_tests();
         let transport = make_transport(
             MockTransport::new(sample_server_info(), sample_tools()).with_hung_call(),
@@ -791,6 +1308,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn bridge_timeout_metric_increments_exactly_once() {
+        let _metric_lock = METRIC_HOOK_LOCK.lock().await;
         crate::metrics::reset_mcp_timeout_metric_hooks_for_tests();
         let before = crate::metrics::mcp_timeout_metric_hooks_snapshot_for_tests();
         let transport = make_transport(
@@ -814,6 +1332,7 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_non_timeout_transport_error_keeps_existing_mapping() {
+        let _metric_lock = METRIC_HOOK_LOCK.lock().await;
         crate::metrics::reset_mcp_timeout_metric_hooks_for_tests();
         let before = crate::metrics::mcp_timeout_metric_hooks_snapshot_for_tests();
         let transport = make_transport(
@@ -841,6 +1360,7 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_success_does_not_increment_timeout_metric() {
+        let _metric_lock = METRIC_HOOK_LOCK.lock().await;
         crate::metrics::reset_mcp_timeout_metric_hooks_for_tests();
         let before = crate::metrics::mcp_timeout_metric_hooks_snapshot_for_tests();
         let call_result = McpCallResult {
@@ -874,6 +1394,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn repeated_timeouts_do_not_leave_accumulating_background_work() {
+        let _metric_lock = METRIC_HOOK_LOCK.lock().await;
         crate::metrics::reset_mcp_timeout_metric_hooks_for_tests();
         let mock =
             Arc::new(MockTransport::new(sample_server_info(), sample_tools()).with_hung_call());

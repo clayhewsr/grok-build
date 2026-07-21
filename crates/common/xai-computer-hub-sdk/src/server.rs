@@ -2446,7 +2446,10 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.started.lock().expect("started lock").push(self.name);
             tokio::time::sleep(std::time::Duration::from_millis(self.sleep_ms)).await;
-            self.completed.lock().expect("completed lock").push(self.name);
+            self.completed
+                .lock()
+                .expect("completed lock")
+                .push(self.name);
         }
     }
 
@@ -2542,7 +2545,11 @@ mod tests {
         let elapsed = t0.elapsed();
 
         assert_eq!(out, EvictDrainResult::TimedOut);
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "second handler should start");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "second handler should start"
+        );
         assert_eq!(*started.lock().expect("started lock"), vec!["h1", "h2"]);
         assert_eq!(*completed.lock().expect("completed lock"), vec!["h1"]);
         assert!(
@@ -2556,13 +2563,7 @@ mod tests {
         let started = Arc::new(std::sync::Mutex::new(Vec::new()));
         let completed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let calls = Arc::new(AtomicUsize::new(0));
-        let handlers = vec![evict_handler(
-            "slow",
-            120,
-            started,
-            completed,
-            calls,
-        )];
+        let handlers = vec![evict_handler("slow", 120, started, completed, calls)];
         let acked = Arc::new(AtomicBool::new(false));
         let acked_for_closure = acked.clone();
         let acked_for_check = acked.clone();

@@ -33,6 +33,20 @@ pub struct McpToolDefinition {
     pub input_schema: Option<serde_json::Value>,
 }
 
+impl McpToolDefinition {
+    /// Adapter-local retry safety hint.
+    ///
+    /// The marker is explicit and opt-in: `"x-retry-safe": true` at the top
+    /// level of `input_schema`.
+    pub fn is_retry_safe(&self) -> bool {
+        self.input_schema
+            .as_ref()
+            .and_then(|schema| schema.get("x-retry-safe"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+}
+
 /// Result of an MCP `tools/call` invocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,6 +102,11 @@ pub enum McpError {
     #[error("transport error: {0}")]
     Transport(String),
 
+    /// A transport failure that happened before the remote tool call could
+    /// execute (e.g., send/connect failure before request dispatch).
+    #[error("pre-call transport error: {0}")]
+    TransportPreCall(String),
+
     /// The server returned a JSON-RPC error response.
     #[error("protocol error (code {code}): {message}")]
     Protocol {
@@ -104,4 +123,24 @@ pub enum McpError {
     /// The response could not be decoded.
     #[error("decode error: {0}")]
     Decode(String),
+}
+
+impl McpError {
+    /// True when this failure class is transient enough to consider retrying.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Transport(_) | Self::TransportPreCall(_) | Self::Timeout(_) => true,
+            Self::Protocol { code, .. } => protocol_code_is_transient(*code),
+            Self::Decode(_) => false,
+        }
+    }
+
+    /// True when transport failed before the remote tool body could run.
+    pub fn happened_before_remote_execution(&self) -> bool {
+        matches!(self, Self::TransportPreCall(_))
+    }
+}
+
+fn protocol_code_is_transient(code: i64) -> bool {
+    matches!(code, 408 | 409 | 425 | 429) || (500..=599).contains(&code)
 }

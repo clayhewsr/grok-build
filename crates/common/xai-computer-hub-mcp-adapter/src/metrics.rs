@@ -38,6 +38,38 @@ mod inner {
         .expect("computer_hub_mcp_call_timeouts_total must register once")
     });
 
+    static MCP_RETRIES_ATTEMPTED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+        register_int_counter!(
+            "computer_hub_mcp_retries_attempted_total",
+            "MCP call retries attempted by the adapter."
+        )
+        .expect("computer_hub_mcp_retries_attempted_total must register once")
+    });
+
+    static MCP_RETRIES_SUCCEEDED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+        register_int_counter!(
+            "computer_hub_mcp_retries_succeeded_total",
+            "MCP calls that succeeded after at least one retry."
+        )
+        .expect("computer_hub_mcp_retries_succeeded_total must register once")
+    });
+
+    static MCP_RETRIES_EXHAUSTED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+        register_int_counter!(
+            "computer_hub_mcp_retries_exhausted_total",
+            "MCP calls that exhausted retry budget and still failed."
+        )
+        .expect("computer_hub_mcp_retries_exhausted_total must register once")
+    });
+
+    static MCP_NON_RETRYABLE_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+        register_int_counter!(
+            "computer_hub_mcp_non_retryable_failures_total",
+            "MCP call failures classified as non-retryable by the adapter."
+        )
+        .expect("computer_hub_mcp_non_retryable_failures_total must register once")
+    });
+
     static MCP_TOOLS_BRIDGED: LazyLock<IntGauge> = LazyLock::new(|| {
         register_int_gauge!(
             "computer_hub_mcp_tools_bridged",
@@ -60,6 +92,30 @@ mod inner {
         crate::metrics::test_hooks::mcp_timeout_inc();
     }
 
+    pub(crate) fn mcp_retry_attempted() {
+        MCP_RETRIES_ATTEMPTED_TOTAL.inc();
+        #[cfg(test)]
+        crate::metrics::test_hooks::mcp_retry_attempted_inc();
+    }
+
+    pub(crate) fn mcp_retry_succeeded() {
+        MCP_RETRIES_SUCCEEDED_TOTAL.inc();
+        #[cfg(test)]
+        crate::metrics::test_hooks::mcp_retry_succeeded_inc();
+    }
+
+    pub(crate) fn mcp_retry_exhausted() {
+        MCP_RETRIES_EXHAUSTED_TOTAL.inc();
+        #[cfg(test)]
+        crate::metrics::test_hooks::mcp_retry_exhausted_inc();
+    }
+
+    pub(crate) fn mcp_non_retryable_failure() {
+        MCP_NON_RETRYABLE_FAILURES_TOTAL.inc();
+        #[cfg(test)]
+        crate::metrics::test_hooks::mcp_non_retryable_failure_inc();
+    }
+
     pub(crate) fn mcp_tools_bridged_set(count: i64) {
         MCP_TOOLS_BRIDGED.set(count);
     }
@@ -72,6 +128,22 @@ mod inner {
     pub(crate) fn mcp_call_timed_out() {
         #[cfg(test)]
         crate::metrics::test_hooks::mcp_timeout_inc();
+    }
+    pub(crate) fn mcp_retry_attempted() {
+        #[cfg(test)]
+        crate::metrics::test_hooks::mcp_retry_attempted_inc();
+    }
+    pub(crate) fn mcp_retry_succeeded() {
+        #[cfg(test)]
+        crate::metrics::test_hooks::mcp_retry_succeeded_inc();
+    }
+    pub(crate) fn mcp_retry_exhausted() {
+        #[cfg(test)]
+        crate::metrics::test_hooks::mcp_retry_exhausted_inc();
+    }
+    pub(crate) fn mcp_non_retryable_failure() {
+        #[cfg(test)]
+        crate::metrics::test_hooks::mcp_non_retryable_failure_inc();
     }
     pub(crate) fn mcp_tools_bridged_set(_count: i64) {}
 }
@@ -90,21 +162,53 @@ mod test_hooks {
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub(crate) struct McpTimeoutMetricHookSnapshot {
         pub timeouts: u64,
+        pub retries_attempted: u64,
+        pub retries_succeeded: u64,
+        pub retries_exhausted: u64,
+        pub non_retryable_failures: u64,
     }
 
     static MCP_TIMEOUT_HOOKS: AtomicU64 = AtomicU64::new(0);
+    static MCP_RETRY_ATTEMPTED_HOOKS: AtomicU64 = AtomicU64::new(0);
+    static MCP_RETRY_SUCCEEDED_HOOKS: AtomicU64 = AtomicU64::new(0);
+    static MCP_RETRY_EXHAUSTED_HOOKS: AtomicU64 = AtomicU64::new(0);
+    static MCP_NON_RETRYABLE_HOOKS: AtomicU64 = AtomicU64::new(0);
 
     pub(crate) fn mcp_timeout_inc() {
         MCP_TIMEOUT_HOOKS.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn mcp_retry_attempted_inc() {
+        MCP_RETRY_ATTEMPTED_HOOKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn mcp_retry_succeeded_inc() {
+        MCP_RETRY_SUCCEEDED_HOOKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn mcp_retry_exhausted_inc() {
+        MCP_RETRY_EXHAUSTED_HOOKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn mcp_non_retryable_failure_inc() {
+        MCP_NON_RETRYABLE_HOOKS.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn reset_mcp_timeout_metric_hooks_for_tests() {
         MCP_TIMEOUT_HOOKS.store(0, Ordering::Relaxed);
+        MCP_RETRY_ATTEMPTED_HOOKS.store(0, Ordering::Relaxed);
+        MCP_RETRY_SUCCEEDED_HOOKS.store(0, Ordering::Relaxed);
+        MCP_RETRY_EXHAUSTED_HOOKS.store(0, Ordering::Relaxed);
+        MCP_NON_RETRYABLE_HOOKS.store(0, Ordering::Relaxed);
     }
 
     pub(crate) fn mcp_timeout_metric_hooks_snapshot_for_tests() -> McpTimeoutMetricHookSnapshot {
         McpTimeoutMetricHookSnapshot {
             timeouts: MCP_TIMEOUT_HOOKS.load(Ordering::Relaxed),
+            retries_attempted: MCP_RETRY_ATTEMPTED_HOOKS.load(Ordering::Relaxed),
+            retries_succeeded: MCP_RETRY_SUCCEEDED_HOOKS.load(Ordering::Relaxed),
+            retries_exhausted: MCP_RETRY_EXHAUSTED_HOOKS.load(Ordering::Relaxed),
+            non_retryable_failures: MCP_NON_RETRYABLE_HOOKS.load(Ordering::Relaxed),
         }
     }
 }
