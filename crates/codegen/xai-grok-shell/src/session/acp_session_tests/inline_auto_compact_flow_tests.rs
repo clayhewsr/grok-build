@@ -37,6 +37,7 @@ async fn create_test_actor(
     let state = TokioMutex::new(State {
         running_task: None,
         pending_inputs: VecDeque::new(),
+        combine_edit_holds: std::collections::HashSet::new(),
         pending_notifications: Vec::new(),
         notifications_suppressed: false,
         rewindable: false,
@@ -53,6 +54,8 @@ async fn create_test_actor(
             top_p: None,
             api_backend: Default::default(),
             extra_headers: Default::default(),
+            query_params: Default::default(),
+            env_http_headers: Default::default(),
             context_window: std::num::NonZeroU64::new(context_window)
                 .expect("test context_window must be non-zero"),
             reasoning_effort: None,
@@ -85,6 +88,7 @@ async fn create_test_actor(
         mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
         mcp_strategy: McpInitStrategy::Blocking,
         chat_state_handle,
+        unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
         pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
@@ -94,6 +98,8 @@ async fn create_test_actor(
         turn_prompt_mode: Arc::new(parking_lot::Mutex::new(PromptMode::Agent)),
         telemetry_enabled: false,
         supports_backend_search: std::cell::Cell::new(false),
+        tool_overrides: std::cell::RefCell::new(None),
+        resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         compactions_remaining: std::cell::Cell::new(None),
         compaction_at_tokens: std::cell::Cell::new(None),
         doom_loop_recovery: None,
@@ -170,6 +176,7 @@ async fn create_test_actor(
             )),
         )),
         goal_enabled: false,
+        background_workflows_enabled: false,
         goal_harness_enabled: std::sync::atomic::AtomicBool::new(false),
         goal_harness_availability_reconciled: std::sync::atomic::AtomicBool::new(false),
         goal_tracker: Arc::new(parking_lot::Mutex::new(
@@ -180,8 +187,10 @@ async fn create_test_actor(
         goal_turn_task_ids: parking_lot::Mutex::new(std::collections::HashSet::new()),
         goal_continuation_streak: std::sync::atomic::AtomicU32::new(0),
         goal_blocked_streak: std::sync::atomic::AtomicU32::new(0),
-        goal_update_rx: std::cell::RefCell::new(Some(tokio::sync::mpsc::unbounded_channel().1)),
+        goal_update_rx: std::cell::RefCell::new(None),
         goal_update_tx: tokio::sync::mpsc::unbounded_channel().0,
+        workflow_manager: crate::session::workflow::manager::WorkflowManager::test_bundle().0,
+        workflow_launch_tx: tokio::sync::mpsc::unbounded_channel().0,
         goal_classifier_enabled: false,
         goal_planner_enabled: false,
         goal_summary_enabled: false,
@@ -192,7 +201,7 @@ async fn create_test_actor(
         goal_strategist_every: 5,
         goal_reverify_after: crate::session::acp_session::GOAL_REVERIFY_AFTER_DEFAULT,
         goal_plan_reconciled: std::sync::atomic::AtomicBool::new(false),
-        pending_classifier_completions: parking_lot::Mutex::new(VecDeque::new()),
+        pending_classifier_completions: parking_lot::Mutex::new(std::collections::VecDeque::new()),
         goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
         managed_mcp_handle: Default::default(),
         managed_mcp_expires_at: std::sync::Mutex::new(None),
@@ -208,6 +217,7 @@ async fn create_test_actor(
         deferred_prefix: TaskSlot::new(),
         extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
         last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
+        prefix_carries_fallback_date: std::cell::Cell::new(false),
         last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
         last_api_request_at: std::sync::atomic::AtomicI64::new(0),
         hook_registry: std::cell::RefCell::new(None),
@@ -466,6 +476,7 @@ async fn create_test_actor_with_memory(
     let state = TokioMutex::new(State {
         running_task: None,
         pending_inputs: VecDeque::new(),
+        combine_edit_holds: std::collections::HashSet::new(),
         pending_notifications: Vec::new(),
         notifications_suppressed: false,
         rewindable: false,
@@ -482,6 +493,8 @@ async fn create_test_actor_with_memory(
             top_p: None,
             api_backend: Default::default(),
             extra_headers: Default::default(),
+            query_params: Default::default(),
+            env_http_headers: Default::default(),
             context_window: std::num::NonZeroU64::new(context_window)
                 .expect("test context_window must be non-zero"),
             reasoning_effort: None,
@@ -518,12 +531,15 @@ async fn create_test_actor_with_memory(
         mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
         mcp_strategy: McpInitStrategy::Blocking,
         chat_state_handle,
+        unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
         pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
         telemetry_enabled: false,
         supports_backend_search: std::cell::Cell::new(false),
+        tool_overrides: std::cell::RefCell::new(None),
+        resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         compactions_remaining: std::cell::Cell::new(None),
         compaction_at_tokens: std::cell::Cell::new(None),
         doom_loop_recovery: None,
@@ -613,6 +629,7 @@ async fn create_test_actor_with_memory(
             )),
         )),
         goal_enabled: false,
+        background_workflows_enabled: false,
         goal_harness_enabled: std::sync::atomic::AtomicBool::new(false),
         goal_harness_availability_reconciled: std::sync::atomic::AtomicBool::new(false),
         goal_tracker: Arc::new(parking_lot::Mutex::new(
@@ -623,8 +640,10 @@ async fn create_test_actor_with_memory(
         goal_turn_task_ids: parking_lot::Mutex::new(std::collections::HashSet::new()),
         goal_continuation_streak: std::sync::atomic::AtomicU32::new(0),
         goal_blocked_streak: std::sync::atomic::AtomicU32::new(0),
-        goal_update_rx: std::cell::RefCell::new(Some(tokio::sync::mpsc::unbounded_channel().1)),
+        goal_update_rx: std::cell::RefCell::new(None),
         goal_update_tx: tokio::sync::mpsc::unbounded_channel().0,
+        workflow_manager: crate::session::workflow::manager::WorkflowManager::test_bundle().0,
+        workflow_launch_tx: tokio::sync::mpsc::unbounded_channel().0,
         goal_classifier_enabled: false,
         goal_planner_enabled: false,
         goal_summary_enabled: false,
@@ -635,7 +654,7 @@ async fn create_test_actor_with_memory(
         goal_strategist_every: 5,
         goal_reverify_after: crate::session::acp_session::GOAL_REVERIFY_AFTER_DEFAULT,
         goal_plan_reconciled: std::sync::atomic::AtomicBool::new(false),
-        pending_classifier_completions: parking_lot::Mutex::new(VecDeque::new()),
+        pending_classifier_completions: parking_lot::Mutex::new(std::collections::VecDeque::new()),
         goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
         managed_mcp_handle: Default::default(),
         managed_mcp_expires_at: std::sync::Mutex::new(None),
@@ -651,6 +670,7 @@ async fn create_test_actor_with_memory(
         deferred_prefix: TaskSlot::new(),
         extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
         last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
+        prefix_carries_fallback_date: std::cell::Cell::new(false),
         last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
         last_api_request_at: std::sync::atomic::AtomicI64::new(0),
         hook_registry: std::cell::RefCell::new(None),
@@ -1183,11 +1203,15 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
             let app = axum::Router::new().route(
                 "/v1/models-v2",
                 get(|| async {
-                    axum::Json(serde_json::json!(
-                        { "data" : [{ "model" : "test-model", "name" : "Test Model",
-                        "context_window" : 300_000, "max_completion_tokens" : 16384,
-                        "base_url" : "http://localhost/v1" }] }
-                    ))
+                    axum::Json(serde_json::json!({
+                        "data": [{
+                            "model": "test-model",
+                            "name": "Test Model",
+                            "context_window": 300_000,
+                            "max_completion_tokens": 16384,
+                            "base_url": "http://localhost/v1"
+                        }]
+                    }))
                 }),
             );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1217,6 +1241,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
             let state = TokioMutex::new(State {
                 running_task: None,
                 pending_inputs: VecDeque::new(),
+                combine_edit_holds: std::collections::HashSet::new(),
                 pending_notifications: Vec::new(),
                 notifications_suppressed: false,
                 rewindable: false,
@@ -1233,6 +1258,8 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     top_p: None,
                     api_backend: Default::default(),
                     extra_headers: Default::default(),
+                    query_params: Default::default(),
+                    env_http_headers: Default::default(),
                     context_window: std::num::NonZeroU64::new(200_000).unwrap(),
                     reasoning_effort: None,
                     stream_tool_calls: None,
@@ -1283,6 +1310,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
                 mcp_strategy: McpInitStrategy::Blocking,
                 chat_state_handle,
+                unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
                 current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(
                     std::collections::HashMap::new(),
@@ -1292,6 +1320,8 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 turn_prompt_mode: Arc::new(parking_lot::Mutex::new(PromptMode::Agent)),
                 telemetry_enabled: false,
                 supports_backend_search: std::cell::Cell::new(false),
+                tool_overrides: std::cell::RefCell::new(None),
+                resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
                 compactions_remaining: std::cell::Cell::new(None),
                 compaction_at_tokens: std::cell::Cell::new(None),
                 doom_loop_recovery: None,
@@ -1370,6 +1400,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     )),
                 )),
                 goal_enabled: false,
+                background_workflows_enabled: false,
                 goal_harness_enabled: std::sync::atomic::AtomicBool::new(false),
                 goal_harness_availability_reconciled: std::sync::atomic::AtomicBool::new(false),
                 goal_tracker: Arc::new(parking_lot::Mutex::new(
@@ -1380,10 +1411,11 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 goal_turn_task_ids: parking_lot::Mutex::new(std::collections::HashSet::new()),
                 goal_continuation_streak: std::sync::atomic::AtomicU32::new(0),
                 goal_blocked_streak: std::sync::atomic::AtomicU32::new(0),
-                goal_update_rx: std::cell::RefCell::new(Some(
-                    tokio::sync::mpsc::unbounded_channel().1,
-                )),
+                goal_update_rx: std::cell::RefCell::new(None),
                 goal_update_tx: tokio::sync::mpsc::unbounded_channel().0,
+                workflow_manager: crate::session::workflow::manager::WorkflowManager::test_bundle()
+                    .0,
+                workflow_launch_tx: tokio::sync::mpsc::unbounded_channel().0,
                 goal_classifier_enabled: false,
                 goal_planner_enabled: false,
                 goal_summary_enabled: false,
@@ -1395,7 +1427,9 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 goal_strategist_every: 5,
                 goal_reverify_after: crate::session::acp_session::GOAL_REVERIFY_AFTER_DEFAULT,
                 goal_plan_reconciled: std::sync::atomic::AtomicBool::new(false),
-                pending_classifier_completions: parking_lot::Mutex::new(VecDeque::new()),
+                pending_classifier_completions: parking_lot::Mutex::new(
+                    std::collections::VecDeque::new(),
+                ),
                 goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
                 managed_mcp_handle: Default::default(),
                 managed_mcp_expires_at: std::sync::Mutex::new(None),
@@ -1411,6 +1445,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 deferred_prefix: TaskSlot::new(),
                 extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
                 last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
+                prefix_carries_fallback_date: std::cell::Cell::new(false),
                 last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
                 last_api_request_at: std::sync::atomic::AtomicI64::new(0),
                 hook_registry: std::cell::RefCell::new(None),

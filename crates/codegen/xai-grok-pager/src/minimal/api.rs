@@ -562,17 +562,14 @@ pub fn resolve_turn_activity(v: &AgentView) -> Option<TurnActivity> {
     v.resolve_turn_activity()
 }
 
-/// [`AgentView::renders_parked`] — while the parked-wait marker's turn is
-/// parked, minimal renders the "watching · …" cue (watchers running) or the
-/// idle hint (none), mirroring the full TUI. The marker itself is pushed by
-/// the shared ACP notification path, so minimal's scrollback carries it too.
+/// [`AgentView::renders_parked`].
 pub fn renders_parked(v: &AgentView) -> bool {
     v.renders_parked()
 }
 
 /// [`AgentView::watchers`] — idle-surviving background work (running
 /// commands / monitors / loops / subagents) for the shared turn-status
-/// widget's "watching · …" cue.
+/// widget's "… still running" cue.
 pub fn watchers(v: &AgentView) -> crate::views::turn_status::Watchers {
     v.watchers()
 }
@@ -745,6 +742,14 @@ pub fn build_session_entry_data(
         state,
         content_width,
     )
+}
+
+/// [`crate::views::session_picker::hidden_external_hint`].
+pub fn hidden_external_hint(
+    entries: Option<&[SessionPickerEntry]>,
+    source_filter: SourceFilter,
+) -> Option<String> {
+    crate::views::session_picker::hidden_external_hint(entries, source_filter)
 }
 
 /// [`crate::views::session_picker::build_grouped_picker_entries`].

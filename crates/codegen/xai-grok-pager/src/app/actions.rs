@@ -222,6 +222,14 @@ pub enum Action {
         id: String,
         new_text: String,
     },
+    /// Hold a server-authoritative row out of combine-on-promote while editing.
+    QueueHoldEditShared {
+        id: String,
+    },
+    /// Release a previous [`Self::QueueHoldEditShared`].
+    QueueReleaseEditShared {
+        id: String,
+    },
     /// Interject a server-authoritative (shared) queued prompt into the running
     /// turn: the agent atomically removes it from the queue and
     /// merges its text into the in-flight turn. Routed as `x.ai/queue/interject`;
@@ -501,6 +509,10 @@ pub enum Action {
     SetHunkTrackerMode(String),
     /// Set default screen mode (`fullscreen` | `minimal`); restart-required.
     SetScreenMode(String),
+    /// Enable/disable the Ctrl+Space / F8 voice-dictation shortcut. SHELL-owned;
+    /// persisted to `[ui].voice_keybind_enabled`. Takes effect on the next
+    /// keypress; `/voice` is unaffected.
+    SetVoiceKeybindEnabled(bool),
     /// Set the voice capture mode (`toggle` | `hold`). SHELL-owned; persisted to
     /// `[ui].voice_capture_mode`. Takes effect for the next Ctrl+Space press.
     SetVoiceCaptureMode(String),
@@ -519,6 +531,12 @@ pub enum Action {
     SetTimeline(bool),
     /// Set `[ui].page_flip_on_send` (default ON). Persists via `Effect::PersistSetting`.
     SetPageFlipOnSend(bool),
+    /// Set whether the drain call site merges the run of leading queued
+    /// `Prompt` entries into one turn instead of sending them one by one.
+    /// SHARED-owned: updates the process-wide cache mirror (read by the
+    /// drain site) and persists to `[ui].combine_queued_prompts` via
+    /// `Effect::PersistSetting`.
+    SetCombineQueuedPrompts(bool),
     /// Set simple mode (ASCII / minimal glyphs). Persists via `Effect::PersistSetting`.
     SetSimpleMode(bool),
     /// Set the per-tip contextual-hint user config (`[ui.contextual_hints]`).
@@ -577,12 +595,23 @@ pub enum Action {
     /// Open the settings modal (F2, `/settings`, command palette).
     /// If already open, closes it instead of stacking.
     OpenSettings,
+    /// Open settings focused on a registry key (e.g. privacy banner Customize).
+    OpenSettingsFocus {
+        key: &'static str,
+    },
+    /// Welcome privacy banner Accept (opt-in; ack after ACP success).
+    PrivacyBannerAccept,
+    /// Welcome privacy banner Customize (ack + open settings on coding_data_sharing).
+    PrivacyBannerCustomize,
     /// Open the command palette (`/help`). The keybinding path (Ctrl+P) opens it
     /// directly in `handle_agent_action`; this lets a slash command reach the
     /// same modal through dispatch.
     OpenCommandPalette,
     /// Open the in-TUI How-to Guides doc picker (`/docs`, palette "How-to Guides").
     OpenHowtoGuides,
+    /// Open the onboarding tutorial overlay (`/tutorial` or the command
+    /// palette).
+    OpenTutorial,
     /// Open the reset-settings confirmation dialog for a specific key.
     /// Moves the Settings modal state into `ResetSettingsConfirm` so
     /// the underlying modal survives the confirm dialog.
@@ -630,7 +659,7 @@ pub enum Action {
     TaskComplete(TaskResult),
     /// Share the current session via URL.
     ShareSession,
-    /// Show session info (ID, cwd, model, context usage) instantly.
+    /// Show session info (auth, ID, cwd, model, context usage) instantly.
     ShowSessionInfo,
     /// Show release notes in a modal.
     ShowReleaseNotes {
@@ -643,8 +672,10 @@ pub enum Action {
     },
     /// Show detailed context usage (progress bar, token breakdown, stats).
     ShowContextInfo,
-    /// Show credit usage via /usage command.
+    /// `/usage` — session token/cost, plus consumer credits when visible.
     ShowUsage,
+    /// `/usage manage` — open consumer billing (no-op if surface hidden).
+    ManageBilling,
     /// Commit a read-only list of the queued prompts as a system block
     /// (`/queue`). The surface minimal mode uses in place of the `QueuePane`.
     ShowQueue,
@@ -742,6 +773,11 @@ pub enum Action {
         model_id: acp::ModelId,
         effort: Option<ReasoningEffort>,
     },
+    DoctorFixConfirmed {
+        target: DoctorFixTarget,
+        plan: Box<crate::diagnostics::FixPlan>,
+    },
+    DoctorFixCancelled(DoctorFixTarget),
     /// User selected a project directory from the project picker.
     ProjectSelected {
         path: std::path::PathBuf,
@@ -934,14 +970,17 @@ pub enum Action {
     OpenMemoryModal,
     /// Open the hidden `/gboom` easter egg (DOOM-style raycaster modal).
     OpenGboom,
-    /// Suspend the TUI and open a file in $EDITOR.
+    /// Suspend the TUI and open a configuration file in `$EDITOR`.
     SuspendForEditor {
         path: std::path::PathBuf,
         /// Reload `/config-agents` list after the editor exits (when set).
         refresh_agents_modal: Option<crate::views::agents_modal::AgentsTab>,
     },
+    /// Edit the current minimal-mode composer draft in an external editor.
+    EditPromptExternal,
     /// Toggle the expanded goal detail overlay.
     ToggleGoalDetail,
+    ToggleWorkflows,
     Rewind,
     RewindShowPicker,
     RewindPickerSelect(usize),
@@ -1114,8 +1153,8 @@ impl PlanModeKind {
 /// variant needs no agent/schema change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelTrigger {
-    /// Wire value `"esc"` (set only by the Esc cancel-retry while
-    /// TurnCancelling; a bare Esc no longer starts a cancel).
+    /// Wire value `"esc"` (bare Esc mid-turn cancel in minimal / non-vim
+    /// mode, plus the Esc cancel-retry while TurnCancelling).
     Esc,
     /// `Ctrl+C` pressed (the default cancel keybinding).
     CtrlC,
@@ -1323,6 +1362,13 @@ pub enum ProbedAttachment {
     /// The attachment probe task failed or timed out.
     ProbeFailed,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DoctorFixTarget {
+    pub agent_id: AgentId,
+    pub session_id: Option<acp::SessionId>,
+    pub session_binding_epoch: u32,
+    pub cwd: std::path::PathBuf,
+}
 #[derive(Debug)]
 pub enum Effect {
     /// Create a new ACP session.
@@ -1526,6 +1572,8 @@ pub enum Effect {
     PersistAnnouncementsHidden {
         hidden_ids: std::collections::BTreeSet<String>,
     },
+    /// Persist `[privacy].privacy_banner_acked` (RFC 3339 dismiss time).
+    PersistPrivacyBannerAcked { acked_at: String },
     /// Persist memory modal fullscreen preference to `[hints]` in config.toml.
     PersistMemoryFullscreen { fullscreen: bool },
     /// Persist the project-picker opt-out to `[hints] project_picker_disabled`.
@@ -1609,6 +1657,17 @@ pub enum Effect {
         session_id: acp::SessionId,
         id: String,
         new_text: String,
+    },
+    /// Hold a server-owned row out of combine-on-promote while the composer
+    /// edits it: fire-and-forget `x.ai/queue/hold_edit`.
+    QueueHoldEdit {
+        session_id: acp::SessionId,
+        id: String,
+    },
+    /// Release a previous [`Self::QueueHoldEdit`]: `x.ai/queue/release_edit`.
+    QueueReleaseEdit {
+        session_id: acp::SessionId,
+        id: String,
     },
     /// Interject a server-owned queued prompt into the running turn:
     /// fire-and-forget `x.ai/queue/interject`. The session actor atomically
@@ -1728,6 +1787,10 @@ pub enum Effect {
         agent_id: AgentId,
         session_id: acp::SessionId,
     },
+    FetchWorkflowsList {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+    },
     /// Toggle a skill via x.ai/skills/toggle (enable/disable without restart).
     ToggleSkill {
         agent_id: AgentId,
@@ -1813,6 +1876,7 @@ pub enum Effect {
         session_id: acp::SessionId,
     },
     /// Fetch and display session info via x.ai/session/info.
+    /// Auth lines are derived in the effect from SessionFlags + env (not Effect fields).
     ShowSessionInfo {
         agent_id: AgentId,
         session_id: acp::SessionId,
@@ -1858,7 +1922,7 @@ pub enum Effect {
     /// before the pager has set `session_id`, causing it to be silently dropped.
     RefreshAvailableCommands {
         agent_id: AgentId,
-        cwd: std::path::PathBuf,
+        session_id: acp::SessionId,
     },
     /// Fire a /btw side question via x.ai/btw ext method.
     SendBtw {
@@ -1995,6 +2059,11 @@ pub enum Effect {
     /// Fetch billing data at the app level (no agent required).
     /// Used on startup to populate the welcome-screen credit warning.
     FetchAppBilling,
+    /// Fetch per-session token/cost via `x.ai/session/usage` (auth-agnostic).
+    FetchSessionUsage {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+    },
     /// Re-fetch remote settings to check subscription gate.
     RefreshGate,
     /// Spawn a debounce sleep task for shell suggestions. `agent_id` rides
@@ -2046,6 +2115,16 @@ pub enum Effect {
     PreparePromptImagePreview {
         preparation: crate::prompt_images::PromptImagePreviewPreparation,
     },
+    PlanDoctorFix {
+        target: DoctorFixTarget,
+        report: Box<crate::diagnostics::DiagnosticReport>,
+        terminal: crate::terminal::TerminalContext,
+        request: crate::slash::command::DoctorRequest,
+    },
+    ApplyDoctorFix {
+        target: DoctorFixTarget,
+        plan: Box<crate::diagnostics::FixPlan>,
+    },
 }
 /// Outcome of an `x.ai/subagent/cancel` request, telling dispatch whether the
 /// pager must finalize the subagent row itself.
@@ -2066,6 +2145,12 @@ pub enum SubagentKillOutcome {
 pub enum McpAuthTriggerOutcome {
     Authenticated,
     SetupRequired(crate::views::mcps_modal::McpSetupConfig),
+}
+#[derive(Clone, Debug)]
+pub enum DoctorPlanningOutcome {
+    Listing(String),
+    Plan(Box<crate::diagnostics::FixPlan>),
+    RunLocally(String),
 }
 /// Result from a completed async [`Effect`].
 ///
@@ -2145,6 +2230,8 @@ pub enum TaskResult {
         /// Degraded conversations lane (`_meta["x.ai/partial"]`), surfaced
         /// as an actionable picker notice instead of a silent empty list.
         partial: Option<crate::app::effects::ConversationsPartial>,
+        /// Directory scope `sessions` were drawn from (`x.ai/listScope`).
+        scope: xai_grok_shell::session::unified_list::ListScope,
         /// Echo of [`Effect::FetchSessionList::seq`]; stale results are dropped.
         seq: u64,
         /// Echo of [`Effect::FetchSessionList::query`]. `Some` marks the
@@ -2388,6 +2475,11 @@ pub enum TaskResult {
         agent_id: AgentId,
         result: Result<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>, String>,
     },
+    WorkflowsListLoaded {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        result: Result<Vec<crate::views::extensions_modal::WorkflowInfo>, String>,
+    },
     /// Skill toggle completed (enable/disable).
     SkillsToggleDone {
         agent_id: AgentId,
@@ -2492,6 +2584,18 @@ pub enum TaskResult {
     /// Context info fetch failed.
     ContextInfoFailed {
         agent_id: AgentId,
+        error: String,
+    },
+    /// `/usage` session ledger fetched. Drop if `session_id` no longer matches.
+    SessionUsageComplete {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        usage: Box<xai_grok_shell::extensions::notification::PromptUsage>,
+    },
+    /// `/usage` session ledger fetch failed. Drop if `session_id` no longer matches.
+    SessionUsageFailed {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
         error: String,
     },
     /// Feedback submitted successfully (fire-and-forget).
@@ -2735,6 +2839,14 @@ pub enum TaskResult {
     },
     /// Shared prompt-image preview state was resolved off-thread.
     PromptImagePreviewPrepared,
+    DoctorFixPlanned {
+        target: DoctorFixTarget,
+        result: Result<DoctorPlanningOutcome, String>,
+    },
+    DoctorFixApplied {
+        target: DoctorFixTarget,
+        result: Result<crate::diagnostics::FixOutcome, String>,
+    },
 }
 #[cfg(test)]
 mod tests {

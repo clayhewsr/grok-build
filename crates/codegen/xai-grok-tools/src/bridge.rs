@@ -141,17 +141,22 @@ impl ToolBridge {
         template: &str,
         placeholders: &serde_json::Value,
     ) -> Option<String> {
-        let registry = &*self.registry;
-        let result;
-        {
-            result = registry
-                .resources
-                .lock()
-                .await
-                .get::<TemplateRenderer>()
-                .and_then(|r| r.render_with_extra(template, placeholders).ok());
-        }
-        result
+        self.registry
+            .resources
+            .lock()
+            .await
+            .get::<TemplateRenderer>()
+            .and_then(|renderer| renderer.render_with_extra(template, placeholders).ok())
+    }
+
+    /// Return the finalized template renderer for multi-part prompt assembly.
+    pub async fn template_renderer_snapshot(&self) -> Option<TemplateRenderer> {
+        self.registry
+            .resources
+            .lock()
+            .await
+            .get::<TemplateRenderer>()
+            .cloned()
     }
 
     pub async fn register_mcp_tools<T>(
@@ -565,7 +570,10 @@ impl ToolBridge {
         {
             return Vec::new();
         }
-        reply_rx.await.unwrap_or_default()
+        reply_rx
+            .await
+            .map(|snapshot| snapshot.tasks)
+            .unwrap_or_default()
     }
 
     pub async fn delete_scheduled_task(
@@ -593,9 +601,15 @@ impl ToolBridge {
             .map_err(|_| {
                 xai_tool_runtime::ToolError::custom("process_manager", "Scheduler actor stopped")
             })?;
-        reply_rx.await.map_err(|_| {
-            xai_tool_runtime::ToolError::custom("process_manager", "Scheduler actor dropped reply")
-        })
+        reply_rx
+            .await
+            .map_err(|_| {
+                xai_tool_runtime::ToolError::custom(
+                    "process_manager",
+                    "Scheduler actor dropped reply",
+                )
+            })?
+            .map_err(crate::implementations::grok_build::scheduler::types::scheduler_tool_error)
     }
 
     /// Move a foreground command to background by tool_call_id.
@@ -820,6 +834,7 @@ mod tests {
             block_waited: false,
             explicitly_killed: false,
             owner_session_id: owner.map(|s| s.to_string()),
+            description: None,
         }
     }
 

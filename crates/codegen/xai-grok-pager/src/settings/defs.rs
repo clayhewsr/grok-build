@@ -614,6 +614,22 @@ pub fn default_settings() -> Vec<SettingMeta> {
             hidden_in_minimal: true,
         },
         SettingMeta {
+            key: "combine_queued_prompts",
+            category: SettingCategory::Editor,
+            owner: SettingOwner::Shared,
+            label: "Combine queued prompts",
+            description: "Merge consecutive plain follow-ups into one model turn \
+                          (TUI shows one bubble each). Stops at bash, slash commands, \
+                          cron, expanded skills, image follow-ups, or a row under edit. \
+                          Default off; applies on local drain and shell promote.",
+            keywords: &["queue", "combine", "batch", "follow-up", "merge", "pending"],
+            kind: SettingKind::Bool {
+                default: ui_default.combine_queued_prompts.unwrap_or(false),
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
             // Persisted key stays `simple_mode`; the user-facing label
             // distinguishes the PROMPT vim-mode (this setting) from the
             // scrollback `vim_mode` keybindings below.
@@ -1335,6 +1351,36 @@ pub fn default_settings() -> Vec<SettingMeta> {
             restart_required: true,
             hidden_in_minimal: false,
         },
+        // SHELL-owned, persisted to `[ui].voice_keybind_enabled`. Default ON —
+        // `None` (inherit) reads as `true`. Disables only the Ctrl+Space / F8
+        // chord; `/voice` (and Esc / the recording-row `[stop]`) keep working.
+        SettingMeta {
+            key: "voice_keybind_enabled",
+            category: SettingCategory::Editor,
+            owner: SettingOwner::Shell,
+            label: "Voice shortcut",
+            description: "Enable the Ctrl+Space / F8 shortcut for voice dictation. \
+                          When off, the keys are ignored; /voice still starts \
+                          dictation.",
+            keywords: &[
+                "voice",
+                "dictation",
+                "mic",
+                "microphone",
+                "speech",
+                "stt",
+                "keybinding",
+                "hotkey",
+                "ctrl+space",
+                "f8",
+                "disable",
+            ],
+            kind: SettingKind::Bool {
+                default: ui_default.voice_keybind_enabled.unwrap_or(true),
+            },
+            restart_required: false,
+            hidden_in_minimal: false,
+        },
         // SHELL-owned, persisted to `[ui].voice_capture_mode`. The `hold` choice
         // is hidden on terminals without key-release reporting (see
         // `effective_enum_choices`) and falls back to `toggle` at runtime.
@@ -1498,8 +1544,7 @@ pub fn default_settings() -> Vec<SettingMeta> {
             category: SettingCategory::Advanced,
             owner: SettingOwner::Shell,
             label: "SSH wrap",
-            description: "At session load over SSH, recommend `grok wrap ssh` for \
-                          clipboard forwarding and terminal restore.",
+            description: "Show a `/doctor` tip when an SSH session is not using `grok wrap`.",
             keywords: &[
                 "ssh",
                 "wrap",

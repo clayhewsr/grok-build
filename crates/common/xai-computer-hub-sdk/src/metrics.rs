@@ -614,6 +614,7 @@ mod test_hooks {
     }
 }
 
+pub(crate) use inner::OidcRefreshOutcome;
 pub(crate) use inner::admission_wait_observe;
 pub(crate) use inner::call_dispatch_observe;
 pub(crate) use inner::call_id_collision;
@@ -632,8 +633,15 @@ pub(crate) use inner::inbox_full_notification_dropped;
 pub(crate) use inner::inbox_full_reject_send_failed;
 pub(crate) use inner::inbox_full_request_rejected;
 pub(crate) use inner::liveness_deadline_expired;
+#[cfg(all(test, feature = "metrics"))]
+pub(crate) use inner::lock_oidc_metrics_test;
 pub(crate) use inner::no_handler;
 pub(crate) use inner::notif_lagged_recovered;
+#[cfg(all(test, feature = "metrics"))]
+pub(crate) use inner::oidc_refresh_count;
+#[cfg(all(test, feature = "metrics"))]
+pub(crate) use inner::oidc_refresh_duration_sample_count;
+pub(crate) use inner::oidc_refresh_observe;
 pub(crate) use inner::pool_connections_dec;
 pub(crate) use inner::pool_connections_inc;
 pub(crate) use inner::pool_evictions_inc;

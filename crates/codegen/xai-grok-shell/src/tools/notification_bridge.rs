@@ -2,7 +2,7 @@
 //! into `xai-grok-shell`'s native systems (ACP gateway, hunk tracker, file state tracker).
 use crate::session::commands::SessionCommand;
 use crate::session::commands::{NotificationPriority, NotificationSource};
-use crate::session::persistence::PersistenceMsg;
+use crate::session::persistence::{DurableAppendError, PersistenceHandle, PersistenceMsg};
 use agent_client_protocol::{self as acp, Client as _};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -31,9 +31,8 @@ pub struct NotificationBridgeConfig {
     /// Shared gate: when false, suppress gateway forwarding.
     /// Events are still processed for hunk tracking and file state.
     pub gateway_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Persistence channel for durably storing notifications.
-    /// Used to persist bash output even when the gateway gate is closed.
-    pub persistence_tx: mpsc::UnboundedSender<PersistenceMsg>,
+    /// Persistence handle for FIFO ordinary writes and durable tombstone barriers.
+    pub persistence: PersistenceHandle,
     /// When true, send incremental `output_delta` instead of full `output`
     /// in bash streaming updates. The client must opt in via the
     /// `x.ai/incrementalBashOutput` capability.
@@ -104,14 +103,108 @@ pub(crate) fn resolved_tool_name(slot: &std::sync::OnceLock<Option<String>>) -> 
 fn stamp_event_id(config: &NotificationBridgeConfig, meta: &mut Option<acp::Meta>) {
     crate::util::event_id::ensure_event_id_meta(&config.session_id.0, meta);
 }
+fn stamp_scheduler_meta(
+    config: &NotificationBridgeConfig,
+    meta: &mut Option<acp::Meta>,
+    generation: &str,
+    revision: u64,
+) {
+    stamp_event_id(config, meta);
+    let meta = meta.get_or_insert_with(acp::Meta::new);
+    meta.insert("x.ai/schedulerGeneration".to_owned(), generation.into());
+    meta.insert("x.ai/schedulerRevision".to_owned(), revision.into());
+}
+fn durable_append_landed(result: Result<(), DurableAppendError>) -> Result<(), String> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(DurableAppendError::Committed(error)) => {
+            tracing::warn!(%error, "Scheduler tombstone committed with bookkeeping failure");
+            Ok(())
+        }
+        Err(DurableAppendError::NotCommitted(error)) => {
+            Err(format!("scheduler tombstone was not committed: {error}"))
+        }
+        Err(DurableAppendError::AcknowledgementLost(error)) => Err(format!(
+            "scheduler tombstone commit status is unknown: {error}"
+        )),
+    }
+}
+async fn handle_scheduled_task_removed(
+    config: &NotificationBridgeConfig,
+    removed: xai_grok_tools::notification::ScheduledTaskRemoved,
+    acknowledgement: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+) -> Result<(), String> {
+    tracing::info!(task_id = %removed.task_id, "Scheduled task removed");
+    let result: Result<Box<serde_json::value::RawValue>, String> = async {
+        let mut meta = None;
+        stamp_scheduler_meta(config, &mut meta, &removed.generation, removed.revision);
+        let notification = crate::extensions::notification::SessionNotification {
+            session_id: config.session_id.clone(),
+            update: crate::extensions::notification::SessionUpdate::ScheduledTaskDeleted {
+                task_id: removed.task_id,
+            },
+            meta: meta.map(serde_json::Value::Object),
+        };
+        let params = serde_json::to_value(&notification)
+            .and_then(|value| serde_json::value::to_raw_value(&value))
+            .map_err(|error| format!("failed to serialize scheduled task deletion: {error}"))?;
+        let update = crate::session::storage::SessionUpdate::Xai(Box::new(notification));
+        if acknowledgement.is_some() {
+            durable_append_landed(config.persistence.append_update_durably(update).await)?;
+        } else {
+            config
+                .persistence
+                .tx
+                .send(PersistenceMsg::Update(update))
+                .map_err(|_| "session persistence stopped".to_owned())?;
+        }
+        Ok(params)
+    }
+    .await;
+    match result {
+        Ok(params) => {
+            if let Some(acknowledgement) = acknowledgement {
+                let _ = acknowledgement.send(Ok(()));
+            }
+            config
+                .gateway
+                .forward_fire_and_forget(acp::ExtNotification::new(
+                    "x.ai/scheduled_task_deleted",
+                    params.into(),
+                ));
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(acknowledgement) = acknowledgement {
+                let _ = acknowledgement.send(Err(error.clone()));
+            }
+            Err(error)
+        }
+    }
+}
 /// Create a `ToolNotificationHandle` and spawn a bridge task that
 /// translates notifications into shell-native systems.
 pub fn spawn_notification_bridge(config: NotificationBridgeConfig) -> ToolNotificationHandle {
-    let (handle, mut rx) = ToolNotificationHandle::channel();
+    let (handle, mut rx) = ToolNotificationHandle::acknowledged_channel();
     tokio::task::spawn_local(async move {
         let mut offsets: HashMap<String, usize> = HashMap::new();
-        while let Some(notification) = rx.recv().await {
-            handle_notification(&config, notification, &mut offsets).await;
+        while let Some(delivery) = rx.recv().await {
+            let acknowledgement = delivery.acknowledgement;
+            match delivery.notification {
+                ToolNotification::ScheduledTaskRemoved(removed) => {
+                    if let Err(error) =
+                        handle_scheduled_task_removed(&config, removed, acknowledgement).await
+                    {
+                        tracing::warn!(%error, "Failed to handle scheduled task removal");
+                    }
+                }
+                notification => {
+                    handle_notification(&config, notification, &mut offsets).await;
+                    if let Some(acknowledgement) = acknowledgement {
+                        let _ = acknowledgement.send(Ok(()));
+                    }
+                }
+            }
         }
         tracing::debug!("Notification bridge task exiting (sender dropped)");
     });
@@ -131,7 +224,7 @@ async fn emit_current_mode_update(
         )),
     );
     stamp_event_id(config, &mut notification.meta);
-    let _ = config.persistence_tx.send(PersistenceMsg::Update(
+    let _ = config.persistence.tx.send(PersistenceMsg::Update(
         crate::session::storage::SessionUpdate::Acp(Box::new(notification.clone())),
     ));
     config.gateway.forward_fire_and_forget(notification);
@@ -187,7 +280,7 @@ async fn handle_notification(
             ));
             let mut notification = acp::SessionNotification::new(config.session_id.clone(), update);
             stamp_event_id(config, &mut notification.meta);
-            let _ = config.persistence_tx.send(PersistenceMsg::Update(
+            let _ = config.persistence.tx.send(PersistenceMsg::Update(
                 crate::session::storage::SessionUpdate::Acp(Box::new(notification.clone())),
             ));
             if config
@@ -200,26 +293,31 @@ async fn handle_notification(
         ToolNotification::BashExecutionComplete(complete) => {
             offsets.remove(&complete.base.tool_call_id);
             tracing::debug!(
-                tool_call_id = % complete.base.tool_call_id, exit_code = ? complete
-                .exit_code, "Bash execution complete notification received"
+                tool_call_id = %complete.base.tool_call_id,
+                exit_code = ?complete.exit_code,
+                "Bash execution complete notification received"
             );
         }
         ToolNotification::BashExecutionTimeout(timeout) => {
             tracing::debug!(
-                tool_call_id = % timeout.base.tool_call_id, elapsed = ? timeout.elapsed,
+                tool_call_id = %timeout.base.tool_call_id,
+                elapsed = ?timeout.elapsed,
                 "Bash execution timeout notification received"
             );
         }
         ToolNotification::BashExecutionFailed(failed) => {
             tracing::warn!(
-                tool_call_id = % failed.tool_call_id, error = % failed.error,
+                tool_call_id = %failed.tool_call_id,
+                error = %failed.error,
                 "Bash execution failed notification received"
             );
         }
         ToolNotification::BashExecutionBackgrounded(bg) => {
             tracing::debug!(
-                tool_call_id = % bg.base.tool_call_id, task_id = % bg.task_id, command =
-                % bg.base.command, output_file = % bg.output_file.display(),
+                tool_call_id = %bg.base.tool_call_id,
+                task_id = %bg.task_id,
+                command = %bg.base.command,
+                output_file = %bg.output_file.display(),
                 "Bash execution backgrounded notification received — forwarding to TUI"
             );
             let mut notification = crate::extensions::notification::SessionNotification {
@@ -240,7 +338,7 @@ async fn handle_notification(
                 stamp_event_id(config, &mut meta_map);
                 notification.meta = meta_map.map(serde_json::Value::Object);
             }
-            let _ = config.persistence_tx.send(PersistenceMsg::Update(
+            let _ = config.persistence.tx.send(PersistenceMsg::Update(
                 crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
             ));
             let params = serde_json::to_value(&notification)
@@ -272,10 +370,12 @@ async fn handle_notification(
                     .await;
             }
             tracing::debug!(
-                path = % written.absolute_path.display(), is_new_file = written
-                .is_new_file, "FileWritten notification forwarded to hunk tracker"
+                path = %written.absolute_path.display(),
+                is_new_file = written.is_new_file,
+                "FileWritten notification forwarded to hunk tracker"
             );
         }
+        ToolNotification::SubagentCompleted(_) => {}
         ToolNotification::TaskCompleted(task_snapshot) => {
             let is_monitor =
                 task_snapshot.kind == xai_grok_tools::computer::types::TaskKind::Monitor;
@@ -287,7 +387,8 @@ async fn handle_notification(
             if task_snapshot.block_waited || task_snapshot.explicitly_killed {
             } else if goal_loop_active {
                 tracing::info!(
-                    task_id = % task_id, is_monitor,
+                    task_id = %task_id,
+                    is_monitor,
                     "auto-wake: suppressed completion (goal loop active)"
                 );
             } else if config.auto_wake_enabled {
@@ -317,7 +418,9 @@ async fn handle_notification(
                 let (respond_to, completion_rx) = tokio::sync::oneshot::channel();
                 let (admission_tx, admission_rx) = tokio::sync::oneshot::channel();
                 tracing::info!(
-                    task_id = % task_id, prompt_id = % prompt_id, is_monitor,
+                    task_id = %task_id,
+                    prompt_id = %prompt_id,
+                    is_monitor,
                     "auto-wake: requesting synthetic prompt admission for completed background task"
                 );
                 let enqueued = config
@@ -333,6 +436,7 @@ async fn handle_notification(
                         traceparent: xai_file_utils::trace_context::current_traceparent(),
                         json_schema: None,
                         send_now: false,
+                        tool_overrides_update: None,
                         admission: Some(crate::session::commands::TaskWakeAdmission {
                             respond_to: admission_tx,
                             fallback: crate::session::commands::TaskWakeFallback {
@@ -376,11 +480,13 @@ async fn handle_notification(
                 xai_grok_telemetry::unified_log::info(
                     "shell.task_wake.bridge_admission",
                     Some(config.session_id.0.as_ref()),
-                    Some(serde_json::json!(
-                        { "task_id" : & task_id, "monitor" : is_monitor, "enqueued" :
-                        enqueued, "admitted" : admitted, "gate" : config
-                        .task_wake_suppressed.get(), }
-                    )),
+                    Some(serde_json::json!({
+                        "task_id": &task_id,
+                        "monitor": is_monitor,
+                        "enqueued": enqueued,
+                        "admitted": admitted,
+                        "gate": config.task_wake_suppressed.get(),
+                    })),
                 );
                 if will_wake {
                     if is_monitor {
@@ -402,7 +508,7 @@ async fn handle_notification(
                             .is_ok();
                         if copy_requested {
                             tracing::info!(
-                                task_id = % task_id,
+                                task_id = %task_id,
                                 "auto-wake: sending synthetic turn trace request"
                             );
                             let _ = trace_tx.send(crate::upload::turn::SyntheticTurnTraceRequest {
@@ -413,13 +519,13 @@ async fn handle_notification(
                             });
                         } else {
                             tracing::debug!(
-                                task_id = % task_id,
+                                task_id = %task_id,
                                 "auto-wake: session snapshot request failed, skipping trace request"
                             );
                         }
                     } else {
                         tracing::debug!(
-                            task_id = % task_id,
+                            task_id = %task_id,
                             "auto-wake: no synthetic trace consumer, skipping trace request"
                         );
                     }
@@ -476,7 +582,7 @@ async fn handle_notification(
                 stamp_event_id(config, &mut meta_map);
                 notification.meta = meta_map.map(serde_json::Value::Object);
             }
-            let _ = config.persistence_tx.send(PersistenceMsg::Update(
+            let _ = config.persistence.tx.send(PersistenceMsg::Update(
                 crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
             ));
             let params = serde_json::to_value(&notification)
@@ -503,12 +609,14 @@ async fn handle_notification(
                 *config.turn_prompt_mode.lock() = crate::session::plan_mode::PromptMode::Plan;
                 let snapshot = config.plan_mode.lock().snapshot();
                 let _ = config
-                    .persistence_tx
+                    .persistence
+                    .tx
                     .send(PersistenceMsg::PlanModeState(snapshot));
                 emit_current_mode_update(config, xai_grok_tools::types::SessionMode::Plan).await;
             }
             tracing::info!(
-                tool_call_id = % entered.tool_call_id, activated,
+                tool_call_id = %entered.tool_call_id,
+                activated,
                 "Plan mode entered via EnterPlanMode tool"
             );
         }
@@ -530,51 +638,60 @@ async fn handle_notification(
                 *config.turn_prompt_mode.lock() = crate::session::plan_mode::PromptMode::Agent;
                 let snapshot = config.plan_mode.lock().snapshot();
                 let _ = config
-                    .persistence_tx
+                    .persistence
+                    .tx
                     .send(PersistenceMsg::PlanModeState(snapshot));
                 emit_current_mode_update(config, xai_grok_tools::types::SessionMode::Default).await;
             }
             tracing::info!(
-                tool_call_id = % exited.tool_call_id, deactivated, has_plan = exited
-                .plan_content.is_some(), "Plan mode exited via ExitPlanMode tool"
+                tool_call_id = %exited.tool_call_id,
+                deactivated,
+                has_plan = exited.plan_content.is_some(),
+                "Plan mode exited via ExitPlanMode tool"
             );
         }
         ToolNotification::UserQuestionAsked(asked) => {
-            tracing::info!(tool_call_id = % asked.tool_call_id, "User question asked");
-        }
-        ToolNotification::LspServerStarting(s) => {
-            tracing::debug!(
-                server = % s.server_name, command = % s.command, "LSP server starting"
+            tracing::info!(
+                tool_call_id = %asked.tool_call_id,
+                "User question asked"
             );
         }
+        ToolNotification::LspServerStarting(s) => {
+            tracing::debug!(server = %s.server_name, command = %s.command, "LSP server starting");
+        }
         ToolNotification::LspServerReady(s) => {
-            tracing::info!(server = % s.server_name, "LSP server ready");
+            tracing::info!(server = %s.server_name, "LSP server ready");
         }
         ToolNotification::LspServerCrashed(s) => {
-            tracing::warn!(server = % s.server_name, "LSP server crashed");
+            tracing::warn!(server = %s.server_name, "LSP server crashed");
         }
         ToolNotification::LspServerRetrying(s) => {
             tracing::warn!(
-                server = % s.server_name, attempt = s.attempt, max_restarts = s
-                .max_restarts, backoff_ms = s.backoff_ms, "LSP server retrying"
+                server = %s.server_name,
+                attempt = s.attempt,
+                max_restarts = s.max_restarts,
+                backoff_ms = s.backoff_ms,
+                "LSP server retrying"
             );
         }
         ToolNotification::LspServerFailed(s) => {
-            tracing::error!(
-                server = % s.server_name, error = % s.error, "LSP server failed"
-            );
+            tracing::error!(server = %s.server_name, error = %s.error, "LSP server failed");
         }
         ToolNotification::ScheduledTaskFired(fired) => {
             tracing::info!(
-                task_id = % fired.task_id, schedule = % fired.human_schedule, subagent_id
-                = fired.subagent_id.as_deref().unwrap_or(""), "Scheduled task fired"
+                task_id = %fired.task_id,
+                schedule = %fired.human_schedule,
+                subagent_id = fired.subagent_id.as_deref().unwrap_or(""),
+                "Scheduled task fired"
             );
             if fired.subagent_id.is_none() {
-                let inject_payload = serde_json::json!(
-                    { "sessionId" : config.session_id, "taskId" : & fired.task_id,
-                    "prompt" : & fired.prompt, "humanSchedule" : & fired.human_schedule,
-                    "nextFireAt" : & fired.next_fire_at, }
-                );
+                let inject_payload = serde_json::json!({
+                    "sessionId": config.session_id,
+                    "taskId": &fired.task_id,
+                    "prompt": &fired.prompt,
+                    "humanSchedule": &fired.human_schedule,
+                    "nextFireAt": &fired.next_fire_at,
+                });
                 if let Ok(params) = serde_json::value::to_raw_value(&inject_payload) {
                     config
                         .gateway
@@ -584,6 +701,8 @@ async fn handle_notification(
                         ));
                 }
             }
+            let mut meta = None;
+            stamp_scheduler_meta(config, &mut meta, &fired.generation, fired.revision);
             let fired_notif = crate::extensions::notification::SessionNotification {
                 session_id: config.session_id.clone(),
                 update: crate::extensions::notification::SessionUpdate::ScheduledTaskFired {
@@ -593,7 +712,7 @@ async fn handle_notification(
                     next_fire_at: fired.next_fire_at,
                     subagent_id: fired.subagent_id,
                 },
-                meta: None,
+                meta: meta.map(serde_json::Value::Object),
             };
             if let Ok(params) =
                 serde_json::to_value(&fired_notif).and_then(|v| serde_json::value::to_raw_value(&v))
@@ -612,14 +731,17 @@ async fn handle_notification(
                 && owner != my_session
             {
                 tracing::warn!(
-                    task_id = % event.task_id, description = % event.description,
-                    monitor_owner = % owner, bridge_session = % my_session,
+                    task_id = %event.task_id,
+                    description = %event.description,
+                    monitor_owner = %owner,
+                    bridge_session = %my_session,
                     "Dropped cross-session monitor event: owner does not match this bridge's session"
                 );
                 return;
             }
             tracing::debug!(
-                task_id = % event.task_id, description = % event.description,
+                task_id = %event.task_id,
+                description = %event.description,
                 "Monitor event received, injecting into session"
             );
             let notification = crate::extensions::notification::SessionNotification {
@@ -644,7 +766,7 @@ async fn handle_notification(
             }
             if config.task_completion_reservations.contains(&event.task_id) {
                 tracing::debug!(
-                    task_id = % event.task_id,
+                    task_id = %event.task_id,
                     "skipping model inject for monitor event: task already auto-woke via TaskCompleted"
                 );
                 return;
@@ -665,36 +787,15 @@ async fn handle_notification(
                 });
         }
         ToolNotification::ScheduledTaskRemoved(removed) => {
-            tracing::info!(task_id = % removed.task_id, "Scheduled task removed");
-            let mut notification = crate::extensions::notification::SessionNotification {
-                session_id: config.session_id.clone(),
-                update: crate::extensions::notification::SessionUpdate::ScheduledTaskDeleted {
-                    task_id: removed.task_id,
-                },
-                meta: None,
-            };
-            {
-                let mut meta_map = None;
-                stamp_event_id(config, &mut meta_map);
-                notification.meta = meta_map.map(serde_json::Value::Object);
-            }
-            let _ = config.persistence_tx.send(PersistenceMsg::Update(
-                crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
-            ));
-            if let Ok(params) = serde_json::to_value(&notification)
-                .and_then(|v| serde_json::value::to_raw_value(&v))
-            {
-                config
-                    .gateway
-                    .forward_fire_and_forget(acp::ExtNotification::new(
-                        "x.ai/scheduled_task_deleted",
-                        params.into(),
-                    ));
+            if let Err(error) = handle_scheduled_task_removed(config, removed, None).await {
+                tracing::warn!(%error, "Failed to handle scheduled task removal");
             }
         }
         ToolNotification::ScheduledTaskCreated(created) => {
-            tracing::info!(task_id = % created.task_id, "Scheduled task created");
-            let mut notification = crate::extensions::notification::SessionNotification {
+            tracing::info!(task_id = %created.task_id, "Scheduled task created");
+            let mut meta = None;
+            stamp_scheduler_meta(config, &mut meta, &created.generation, created.revision);
+            let notification = crate::extensions::notification::SessionNotification {
                 session_id: config.session_id.clone(),
                 update: crate::extensions::notification::SessionUpdate::ScheduledTaskCreated {
                     task_id: created.task_id,
@@ -702,14 +803,9 @@ async fn handle_notification(
                     human_schedule: created.human_schedule,
                     next_fire_at: created.next_fire_at,
                 },
-                meta: None,
+                meta: meta.map(serde_json::Value::Object),
             };
-            {
-                let mut meta_map = None;
-                stamp_event_id(config, &mut meta_map);
-                notification.meta = meta_map.map(serde_json::Value::Object);
-            }
-            let _ = config.persistence_tx.send(PersistenceMsg::Update(
+            let _ = config.persistence.tx.send(PersistenceMsg::Update(
                 crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
             ));
             if let Ok(params) = serde_json::to_value(&notification)
@@ -742,9 +838,8 @@ mod tests {
         let notification = handle_notification(config, notification, offsets);
         tokio::pin!(notification);
         let mut command = tokio::select! {
-            _ = & mut notification =>
-            panic!("notification completed before requesting admission"), command =
-            cmd_rx.recv() => command.expect("expected task-wake prompt"),
+            _ = &mut notification => panic!("notification completed before requesting admission"),
+            command = cmd_rx.recv() => command.expect("expected task-wake prompt"),
         };
         let SessionCommand::Prompt { admission, .. } = &mut command else {
             panic!("expected task-wake prompt");
@@ -796,7 +891,7 @@ mod tests {
             prompt_index: Arc::new(TokioMutex::new(0)),
             cwd: PathBuf::from("/tmp"),
             gateway_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            persistence_tx,
+            persistence: PersistenceHandle::from_sender_for_test(persistence_tx),
             incremental_bash_output: false,
             plan_mode: Arc::new(parking_lot::Mutex::new(
                 crate::session::plan_mode::PlanModeTracker::new(PathBuf::from("/tmp/test-session")),
@@ -841,6 +936,7 @@ mod tests {
             block_waited: false,
             explicitly_killed: false,
             owner_session_id: None,
+            description: None,
         }
     }
     #[tokio::test]
@@ -1105,9 +1201,8 @@ mod tests {
         );
         tokio::pin!(notification);
         tokio::select! {
-            _ = & mut notification => panic!("admission should still be waiting"),
-            command = cmd_rx.recv() => assert!(matches!(command,
-            Some(SessionCommand::Prompt { .. }))),
+            _ = &mut notification => panic!("admission should still be waiting"),
+            command = cmd_rx.recv() => assert!(matches!(command, Some(SessionCommand::Prompt { .. }))),
         }
         tokio::time::advance(TASK_WAKE_ADMISSION_TIMEOUT + std::time::Duration::from_millis(1))
             .await;
@@ -1147,7 +1242,7 @@ mod tests {
         );
         tokio::pin!(notification);
         let prompt = tokio::select! {
-            _ = & mut notification => panic!("admission should still be waiting"),
+            _ = &mut notification => panic!("admission should still be waiting"),
             command = cmd_rx.recv() => command.expect("prompt command"),
         };
         tokio::time::advance(TASK_WAKE_ADMISSION_TIMEOUT + std::time::Duration::from_millis(1))
@@ -1162,11 +1257,10 @@ mod tests {
         else {
             panic!("expected task wake prompt");
         };
-        assert!(
-            matches!(admission.fallback.source, NotificationSource::MonitorCompleted {
-            ref task_id }
-if task_id == "mon-timeout")
-        );
+        assert!(matches!(
+            admission.fallback.source,
+            NotificationSource::MonitorCompleted { ref task_id } if task_id == "mon-timeout"
+        ));
         assert!(admission.respond_to.send(true).is_err());
         let _ = respond_to.send(Ok(crate::session::commands::PromptTurnOk {
             stop_reason: acp::StopReason::Cancelled,
@@ -1175,6 +1269,7 @@ if task_id == "mon-timeout")
             completion_kind: crate::session::commands::PromptCompletionKind::RemovedFromQueue,
             structured_output: None,
             usage: None,
+            tool_overrides: None,
         }));
         assert!(matches!(
             cmd_rx.try_recv(),
@@ -1463,6 +1558,8 @@ if task_id == "mon-timeout")
                 prompt: "check deploy".into(),
                 human_schedule: "every 5 minutes".into(),
                 next_fire_at: Some("2026-01-01T00:00:00Z".into()),
+                generation: "generation-a".into(),
+                revision: 1,
             },
         );
         let mut offsets = HashMap::new();
@@ -1476,6 +1573,9 @@ if task_id == "mon-timeout")
                     &notif.update,
                     crate::extensions::notification::SessionUpdate::ScheduledTaskCreated { .. }
                 ));
+                let meta = notif.meta.as_ref().expect("scheduler metadata");
+                assert_eq!(meta["x.ai/schedulerGeneration"], "generation-a");
+                assert_eq!(meta["x.ai/schedulerRevision"], 1);
                 assert!(
                     notif
                         .meta
@@ -1537,13 +1637,14 @@ if task_id == "mon-timeout")
     #[tokio::test]
     async fn scheduled_task_removed_is_persisted() {
         let (config, _gateway_rx, mut persistence_rx, _cmd_rx) = make_test_config_full();
-        let notification = ToolNotification::ScheduledTaskRemoved(
-            xai_grok_tools::notification::types::ScheduledTaskRemoved {
-                task_id: "loop-1".into(),
-            },
-        );
-        let mut offsets = HashMap::new();
-        handle_notification(&config, notification, &mut offsets).await;
+        let removed = xai_grok_tools::notification::ScheduledTaskRemoved {
+            task_id: "loop-1".into(),
+            generation: "generation-a".into(),
+            revision: 2,
+        };
+        handle_scheduled_task_removed(&config, removed, None)
+            .await
+            .unwrap();
         let msg = persistence_rx
             .try_recv()
             .expect("scheduled_task_removed must be persisted");
@@ -1557,9 +1658,48 @@ if task_id == "mon-timeout")
                     xai_persisted_event_id(&notif).is_some(),
                     "the persisted deletion line must be stamped"
                 );
+                let meta = notif.meta.as_ref().expect("scheduler metadata");
+                assert_eq!(meta["x.ai/schedulerGeneration"], "generation-a");
+                assert_eq!(meta["x.ai/schedulerRevision"], 2);
             }
             _ => panic!("expected PersistenceMsg::Update(Xai(ScheduledTaskDeleted))"),
         }
+    }
+    #[tokio::test]
+    async fn acknowledged_scheduler_removal_appends_before_ack_and_broadcast() {
+        let (config, mut gateway_rx, mut persistence_rx, _cmd_rx) = make_test_config_full();
+        let removed = xai_grok_tools::notification::ScheduledTaskRemoved {
+            task_id: "loop-ack".into(),
+            generation: "generation-a".into(),
+            revision: 17,
+        };
+        let (acknowledgement, mut receipt) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let persistence = async {
+            let PersistenceMsg::AppendUpdateDurablyAndAck {
+                update: crate::session::storage::SessionUpdate::Xai(notification),
+                respond_to,
+            } = persistence_rx.recv().await.expect("durable append")
+            else {
+                panic!("expected durable scheduler tombstone");
+            };
+            assert_eq!(notification.meta.unwrap()["x.ai/schedulerRevision"], 17);
+            assert!(gateway_rx.try_recv().is_err());
+            assert!(matches!(
+                receipt.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            respond_to.send(Ok(())).unwrap();
+            receipt.await.unwrap().unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            handle_scheduled_task_removed(&config, removed, Some(acknowledgement)),
+            persistence,
+        );
+        result.unwrap();
+        assert!(matches!(
+            gateway_rx.try_recv(),
+            Ok(xai_acp_lib::AcpClientMessage::ExtNotification(_))
+        ));
     }
     fn xai_persisted_event_id(
         notif: &crate::extensions::notification::SessionNotification,
@@ -1644,16 +1784,33 @@ if task_id == "mon-timeout")
             _ => panic!("expected Acp update"),
         }
     }
+    #[test]
+    fn durable_append_mapping_respects_commit_disposition() {
+        assert!(
+            durable_append_landed(Err(DurableAppendError::Committed(std::io::Error::other(
+                "summary failed"
+            ),)))
+            .is_ok()
+        );
+        for failure in [
+            DurableAppendError::NotCommitted(std::io::Error::other("append failed")),
+            DurableAppendError::AcknowledgementLost(std::io::Error::other("lost")),
+        ] {
+            assert!(durable_append_landed(Err(failure)).is_err());
+        }
+    }
     #[tokio::test]
     async fn scheduled_task_fired_is_not_persisted() {
-        let (config, _gateway_rx, mut persistence_rx, _cmd_rx) = make_test_config_full();
+        let (config, mut gateway_rx, mut persistence_rx, _cmd_rx) = make_test_config_full();
         let notification = ToolNotification::ScheduledTaskFired(
             xai_grok_tools::notification::types::ScheduledTaskFired {
                 task_id: "loop-1".into(),
                 prompt: "check deploy".into(),
                 human_schedule: "every 5 minutes".into(),
                 next_fire_at: Some("2026-01-01T00:00:00Z".into()),
-                subagent_id: None,
+                subagent_id: Some("subagent-1".into()),
+                generation: "generation-a".into(),
+                revision: 3,
             },
         );
         let mut offsets = HashMap::new();
@@ -1662,6 +1819,15 @@ if task_id == "mon-timeout")
             persistence_rx.try_recv().is_err(),
             "scheduled_task_fired must NOT be persisted (recurring \u{2192} unbounded log growth)"
         );
+        let fired = gateway_rx
+            .try_recv()
+            .expect("scheduled fire must be broadcast");
+        let xai_acp_lib::AcpClientMessage::ExtNotification(fired) = fired else {
+            panic!("expected scheduler fire notification");
+        };
+        let value: serde_json::Value = serde_json::from_str(fired.request.params.get()).unwrap();
+        assert_eq!(value["_meta"]["x.ai/schedulerGeneration"], "generation-a");
+        assert_eq!(value["_meta"]["x.ai/schedulerRevision"], 3);
     }
     fn make_monitor_event_notification(task_id: &str, owner: Option<&str>) -> ToolNotification {
         ToolNotification::MonitorEvent(xai_grok_tools::notification::types::MonitorEvent {
@@ -1825,11 +1991,10 @@ if task_id == "mon-timeout")
             } => {
                 assert!(prompt_id.starts_with("bash-completed-"));
                 assert_eq!(priority, NotificationPriority::Later);
-                assert!(
-                    matches!(source, NotificationSource::BashTaskCompleted { ref task_id
-                    }
-if task_id == "bg-disabled")
-                );
+                assert!(matches!(
+                    source,
+                    NotificationSource::BashTaskCompleted { ref task_id } if task_id == "bg-disabled"
+                ));
                 let text = match &prompt_blocks[0] {
                     acp::ContentBlock::Text(t) => &t.text,
                     _ => panic!("expected text block"),
@@ -2058,6 +2223,7 @@ if task_id == "bg-disabled")
             block_waited: false,
             explicitly_killed: false,
             owner_session_id: None,
+            description: None,
         }
     }
     /// Extract the auto-wake prompt text emitted on the session command channel.

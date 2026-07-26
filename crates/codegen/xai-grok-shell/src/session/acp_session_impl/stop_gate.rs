@@ -387,6 +387,7 @@ mod stop_gate_snapshot_tests {
             block_waited: false,
             explicitly_killed: false,
             owner_session_id: None,
+            description: None,
         }
     }
 
@@ -487,8 +488,7 @@ mod stop_gate_snapshot_tests {
         ]);
 
         assert!(
-            matches!(&results[0], HookRunResult::Success { hook_name, .. }
-if hook_name == "gate"),
+            matches!(&results[0], HookRunResult::Success { hook_name, .. } if hook_name == "gate"),
             "a discarded decision must read as success, got {:?}",
             results[0]
         );

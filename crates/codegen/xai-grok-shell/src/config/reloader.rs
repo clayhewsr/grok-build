@@ -273,7 +273,7 @@ impl ConfigReloader {
         }
     }
 
-    fn reload_auth(&mut self) -> anyhow::Result<()> {
+    pub(crate) fn reload_auth(&mut self) -> anyhow::Result<()> {
         let auth_path = self.grok_home.join("auth.json");
         let store = read_auth_json(&auth_path)?;
 
@@ -766,8 +766,7 @@ mod tests {
             .expect("first event should dispatch within 2s")
             .expect("channel open");
         assert!(
-            matches!(update, ConfigUpdate::ProjectMcpServersChanged { cwd: ref c }
-if *c == cwd),
+            matches!(update, ConfigUpdate::ProjectMcpServersChanged { cwd: ref c } if *c == cwd),
             "first project event must dispatch"
         );
 
@@ -791,8 +790,7 @@ if *c == cwd),
             .expect("changed content should dispatch within 2s")
             .expect("channel open");
         assert!(
-            matches!(update, ConfigUpdate::ProjectMcpServersChanged { cwd: ref c }
-if *c == cwd),
+            matches!(update, ConfigUpdate::ProjectMcpServersChanged { cwd: ref c } if *c == cwd),
             "changed project config must dispatch"
         );
 
