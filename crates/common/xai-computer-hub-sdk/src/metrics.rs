@@ -506,6 +506,75 @@ mod inner {
         ADMISSION_WAIT_SECONDS.observe(secs);
     }
 
+    /// Closed-set outcomes for `AuthProvider::current` (metric labels).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum OidcRefreshOutcome {
+        SkippedNotExpired,
+        Ok,
+        FailedUsedStale,
+    }
+
+    impl OidcRefreshOutcome {
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::SkippedNotExpired => "skipped_not_expired",
+                Self::Ok => "ok",
+                Self::FailedUsedStale => "failed_used_stale",
+            }
+        }
+    }
+
+    static OIDC_REFRESH_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "computer_hub_oidc_refresh_total",
+            "OIDC AuthProvider::current outcomes: skipped_not_expired (no network), \
+             ok (refresh succeeded), failed_used_stale (refresh failed, stale token returned).",
+            &["outcome"]
+        )
+        .expect("computer_hub_oidc_refresh_total must register once")
+    });
+
+    static OIDC_REFRESH_DURATION_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+        register_histogram!(
+            "computer_hub_oidc_refresh_duration_seconds",
+            "Wall-clock time of an attempted OIDC refresh (discovery + token exchange). \
+             Not sampled for skipped_not_expired.",
+            exponential_buckets(0.01, 2.0, 14).expect("valid bucket params")
+        )
+        .expect("computer_hub_oidc_refresh_duration_seconds must register once")
+    });
+
+    pub(crate) fn oidc_refresh_observe(outcome: OidcRefreshOutcome, secs: Option<f64>) {
+        OIDC_REFRESH_TOTAL
+            .with_label_values(&[outcome.as_str()])
+            .inc();
+        if let Some(secs) = secs {
+            OIDC_REFRESH_DURATION_SECONDS.observe(secs);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn oidc_refresh_count(outcome: OidcRefreshOutcome) -> u64 {
+        OIDC_REFRESH_TOTAL
+            .with_label_values(&[outcome.as_str()])
+            .get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn oidc_refresh_duration_sample_count() -> u64 {
+        OIDC_REFRESH_DURATION_SECONDS.get_sample_count()
+    }
+
+    #[cfg(test)]
+    static OIDC_METRICS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(test)]
+    pub(crate) fn lock_oidc_metrics_test() -> std::sync::MutexGuard<'static, ()> {
+        OIDC_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub(crate) fn evict_drain_completed() {
         EVICT_DRAIN_COMPLETED_TOTAL.inc();
         #[cfg(test)]
@@ -564,6 +633,13 @@ mod inner {
     pub(crate) fn tool_call_inflight_inc(_scope: &str) {}
     pub(crate) fn tool_call_inflight_dec(_scope: &str) {}
     pub(crate) fn admission_wait_observe(_secs: f64) {}
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum OidcRefreshOutcome {
+        SkippedNotExpired,
+        Ok,
+        FailedUsedStale,
+    }
+    pub(crate) fn oidc_refresh_observe(_outcome: OidcRefreshOutcome, _secs: Option<f64>) {}
     pub(crate) fn evict_drain_completed() {
         #[cfg(test)]
         crate::metrics::test_hooks::evict_drain_completed_inc();
@@ -623,10 +699,10 @@ pub(crate) use inner::cancel_hook_received;
 pub(crate) use inner::cancel_no_target;
 pub(crate) use inner::cancel_pending_tombstoned;
 pub(crate) use inner::demux_inbox_depth_set;
+pub(crate) use inner::early_notif_buffered;
 pub(crate) use inner::evict_drain_completed;
 pub(crate) use inner::evict_drain_duration_observe;
 pub(crate) use inner::evict_drain_timed_out;
-pub(crate) use inner::early_notif_buffered;
 pub(crate) use inner::heartbeat_pong_dropped;
 pub(crate) use inner::hook_send;
 pub(crate) use inner::inbox_full_notification_dropped;
@@ -646,8 +722,8 @@ pub(crate) use inner::pool_connections_dec;
 pub(crate) use inner::pool_connections_inc;
 pub(crate) use inner::pool_evictions_inc;
 pub(crate) use inner::progress_frame_forwarded;
-pub(crate) use inner::reconnect_cause;
 pub(crate) use inner::reconnect_backoff_delay_observe;
+pub(crate) use inner::reconnect_cause;
 pub(crate) use inner::reconnect_duration_observe;
 pub(crate) use inner::reconnect_failed;
 pub(crate) use inner::reconnect_gap_observe;
