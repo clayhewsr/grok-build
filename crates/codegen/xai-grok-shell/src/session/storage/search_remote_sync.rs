@@ -11,14 +11,14 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use super::search_fts::SessionSearchIndex;
-
-/// GCS bucket for session search index sync (same as session traces);
-/// `None` makes remote sync a no-op.
-const SEARCH_INDEX_BUCKET: Option<&str> = crate::upload::gcs::SESSION_TRACES_BUCKET;
+use crate::auth::{AuthManager, GrokComConfig};
+use crate::session::repo_changes::{TraceExportConfig, UploadMethod};
+use xai_file_utils::storage_client::ExistsResult;
 
 /// GCS object name for the compressed index.
 const REMOTE_INDEX_OBJECT: &str = "session_search.sqlite.zst";
@@ -35,6 +35,13 @@ const STALENESS_THRESHOLD: Duration = Duration::from_secs(3600);
 
 /// SQLite meta key for the last successful bootstrap timestamp (unix secs).
 const META_KEY_LAST_BOOTSTRAP: &str = "last_bootstrap_at";
+
+#[derive(Clone)]
+pub struct RemoteSyncRuntime {
+    pub config: RemoteSyncConfig,
+    pub gcs_config: TraceExportConfig,
+    pub auth_manager: Option<Arc<AuthManager>>,
+}
 
 // Configuration
 
@@ -61,25 +68,49 @@ impl Default for RemoteSyncConfig {
     }
 }
 
-// Debounce state (global, per-process)
+// Debounce state (per target, per process)
+static LAST_UPLOAD_AT_BY_TARGET: OnceLock<Mutex<std::collections::HashMap<String, i64>>> =
+    OnceLock::new();
 
-/// Unix timestamp (seconds) of the last successful upload.
-/// `0` means no upload has occurred this process lifetime.
-static LAST_UPLOAD_AT: AtomicI64 = AtomicI64::new(0);
+fn upload_debounce_map() -> &'static Mutex<std::collections::HashMap<String, i64>> {
+    LAST_UPLOAD_AT_BY_TARGET.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
 
-/// Returns true if enough time has passed since the last upload.
-fn upload_debounce_ok() -> bool {
-    let last = LAST_UPLOAD_AT.load(Ordering::Relaxed);
-    if last == 0 {
-        return true;
-    }
+fn upload_target_key(config: &RemoteSyncConfig, gcs_config: &TraceExportConfig) -> String {
+    let method = match &gcs_config.upload_method {
+        UploadMethod::Proxy { proxy_base_url, .. } => format!("proxy:{proxy_base_url}"),
+        UploadMethod::Direct { .. } => {
+            format!("direct:{}", gcs_config.bucket_url.as_deref().unwrap_or(""))
+        }
+        UploadMethod::S3 {
+            bucket,
+            region,
+            endpoint_url,
+            ..
+        } => format!(
+            "s3:{bucket}:{region}:{}",
+            endpoint_url.as_deref().unwrap_or_default()
+        ),
+    };
+    format!("{method}|{}", config.gcs_prefix)
+}
+
+/// Returns true if enough time has passed since the last successful upload for this target.
+fn upload_debounce_ok(target: &str) -> bool {
     let now = chrono::Utc::now().timestamp();
+    let map = upload_debounce_map();
+    let guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(last) = guard.get(target).copied() else {
+        return true;
+    };
     (now - last) >= UPLOAD_DEBOUNCE.as_secs() as i64
 }
 
-/// Record that an upload just completed.
-fn record_upload() {
-    LAST_UPLOAD_AT.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+/// Record that an upload just completed for this target.
+fn record_upload(target: &str) {
+    let map = upload_debounce_map();
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard.insert(target.to_string(), chrono::Utc::now().timestamp());
 }
 
 // Compression / decompression
@@ -171,6 +202,194 @@ fn gcs_object_path(config: &RemoteSyncConfig) -> String {
     format!("{}/{}", config.gcs_prefix, REMOTE_INDEX_OBJECT)
 }
 
+pub fn resolve_runtime() -> Option<RemoteSyncRuntime> {
+    let root = match crate::config::load_effective_config() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error = %e, "REMOTE_SYNC_DISABLED: unable to load effective config");
+            return None;
+        }
+    };
+
+    let remote_sync = root
+        .get("session_search")
+        .and_then(|v| v.get("remote_sync"))
+        .and_then(|v| v.clone().try_into::<RemoteSyncConfig>().ok())
+        .unwrap_or_default();
+    if !remote_sync.enabled {
+        tracing::debug!("REMOTE_SYNC_DISABLED: session_search.remote_sync.enabled=false");
+        return None;
+    }
+
+    let endpoints = root
+        .get("endpoints")
+        .and_then(|v| {
+            v.clone()
+                .try_into::<crate::agent::config::EndpointsConfig>()
+                .ok()
+        })
+        .unwrap_or_default();
+    let auth_cfg = root
+        .get("auth")
+        .and_then(|v| v.clone().try_into::<GrokComConfig>().ok())
+        .unwrap_or_default();
+
+    let grok_home = crate::util::grok_home::grok_home();
+    let auth_manager = Arc::new(AuthManager::new(&grok_home, auth_cfg));
+
+    let auth_token = if endpoints.deployment_key.is_none() {
+        auth_manager
+            .current_or_expired()
+            .filter(|auth| auth.is_xai_auth())
+            .map(|auth| auth.key)
+    } else {
+        None
+    };
+    let Some(upload_method) = endpoints.resolve_upload_method(auth_token) else {
+        tracing::warn!("REMOTE_SYNC_DISABLED: no upload method available for remote sync");
+        return None;
+    };
+
+    let bucket_url = match &upload_method {
+        UploadMethod::Direct { .. } => match endpoints.resolve_trace_bucket_url() {
+            Some(resolved) => Some(resolved.value),
+            None => {
+                tracing::warn!(
+                    "REMOTE_SYNC_DISABLED: direct upload selected but no trace bucket configured"
+                );
+                return None;
+            }
+        },
+        UploadMethod::S3 { bucket, .. } => Some(format!("s3://{bucket}")),
+        UploadMethod::Proxy { .. } => None,
+    };
+
+    let gcs_prefix = remote_sync.gcs_prefix.clone();
+    Some(RemoteSyncRuntime {
+        config: remote_sync,
+        gcs_config: TraceExportConfig {
+            bucket_url,
+            service_account_key: None,
+            prefix_dir: None,
+            gcs_prefix: Some(gcs_prefix),
+            absolute_paths: false,
+            archive_name_override: None,
+            upload_method,
+        },
+        auth_manager: Some(auth_manager),
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RemoteMetadata {
+    /// Epoch seconds.
+    timestamp_unix: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RemoteProbe {
+    Found(RemoteMetadata),
+    NotFound,
+}
+
+fn generation_to_unix_secs(generation: i64) -> Option<i64> {
+    if generation <= 0 {
+        return None;
+    }
+    // GCS generation is typically microseconds since epoch.
+    if generation > 1_000_000_000_000 {
+        return Some(generation / 1_000_000);
+    }
+    Some(generation)
+}
+
+async fn probe_remote_metadata(
+    object_path: &str,
+    gcs_config: &TraceExportConfig,
+    auth_manager: Option<Arc<AuthManager>>,
+) -> io::Result<RemoteProbe> {
+    match &gcs_config.upload_method {
+        UploadMethod::Proxy {
+            proxy_base_url,
+            user_token,
+            deployment_key,
+            alpha_test_key,
+        } => {
+            let client = crate::auth::credential_provider::build_storage_client_for_proxy(
+                proxy_base_url,
+                deployment_key.clone(),
+                alpha_test_key.clone(),
+                auth_manager,
+                Some(user_token.clone()),
+                None,
+                "grok-shell",
+            );
+            match client.check_exists(object_path).await {
+                ExistsResult::Found(resp) => {
+                    let Some(remote_ts) = generation_to_unix_secs(resp.generation) else {
+                        return Err(io::Error::other(
+                            "REMOTE_METADATA_FAILED: invalid/unknown object generation",
+                        ));
+                    };
+                    Ok(RemoteProbe::Found(RemoteMetadata {
+                        timestamp_unix: remote_ts,
+                    }))
+                }
+                ExistsResult::NotFound => Ok(RemoteProbe::NotFound),
+                ExistsResult::Unauthorized => Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "REMOTE_METADATA_FAILED: unauthorized",
+                )),
+                ExistsResult::ProbeFailed => Err(io::Error::other(
+                    "REMOTE_METADATA_FAILED: metadata probe failed",
+                )),
+            }
+        }
+        _ => Err(io::Error::other(
+            "REMOTE_METADATA_FAILED: metadata probe unsupported for this upload method",
+        )),
+    }
+}
+
+fn temp_sibling(path: &Path, tag: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{tag}.{}.tmp", uuid::Uuid::now_v7()));
+    PathBuf::from(name)
+}
+
+async fn download_compressed_to_path(
+    object_path: &str,
+    gcs_config: &TraceExportConfig,
+    auth_manager: Option<Arc<AuthManager>>,
+    compressed_path: &Path,
+) -> io::Result<()> {
+    match &gcs_config.upload_method {
+        UploadMethod::Proxy {
+            proxy_base_url,
+            user_token,
+            deployment_key,
+            alpha_test_key,
+        } => {
+            let client = crate::auth::credential_provider::build_storage_client_for_proxy(
+                proxy_base_url,
+                deployment_key.clone(),
+                alpha_test_key.clone(),
+                auth_manager,
+                Some(user_token.clone()),
+                None,
+                "grok-shell",
+            );
+            client
+                .download_blob(object_path, compressed_path)
+                .await
+                .map_err(io::Error::other)
+        }
+        _ => Err(io::Error::other(
+            "REMOTE_DOWNLOAD_FAILED: download unsupported for this upload method",
+        )),
+    }
+}
+
 // Upload (fire-and-forget, debounced)
 
 /// Compress and upload the local search index to GCS.
@@ -179,36 +398,46 @@ fn gcs_object_path(config: &RemoteSyncConfig) -> String {
 /// propagated. The upload is debounced to at most once per hour.
 ///
 /// Called after bootstrap completion when remote sync is enabled.
-pub async fn maybe_upload_index(
-    db_path: PathBuf,
-    config: RemoteSyncConfig,
-    gcs_config: xai_file_utils::TraceExportConfig,
-    auth_manager: Option<std::sync::Arc<crate::auth::AuthManager>>,
-) {
+pub async fn maybe_upload_index(db_path: PathBuf, runtime: &RemoteSyncRuntime) -> bool {
+    let config = &runtime.config;
+    let gcs_config = &runtime.gcs_config;
+    let auth_manager = runtime.auth_manager.clone();
+
     if !config.enabled {
-        return;
+        tracing::debug!("REMOTE_SYNC_DISABLED: upload skipped");
+        return false;
     }
-    if !upload_debounce_ok() {
-        tracing::debug!("skipping search index upload (debounce)");
-        return;
+    let target = upload_target_key(config, gcs_config);
+    if !upload_debounce_ok(&target) {
+        tracing::debug!(
+            target,
+            "LOCAL_FALLBACK: skipping search index upload (debounce)"
+        );
+        return false;
     }
     if !db_path.exists() {
-        tracing::debug!("skipping search index upload (no local DB)");
-        return;
+        tracing::debug!("LOCAL_FALLBACK: skipping search index upload (no local DB)");
+        return false;
     }
 
-    tokio::spawn(async move {
-        if let Err(e) = upload_index_inner(&db_path, &config, &gcs_config, auth_manager).await {
-            tracing::warn!(error = %e, "search index GCS upload failed");
+    match upload_index_inner(&db_path, config, gcs_config, auth_manager).await {
+        Ok(()) => {
+            record_upload(&target);
+            tracing::info!(target, "REMOTE_UPLOAD_SUCCESS");
+            true
         }
-    });
+        Err(e) => {
+            tracing::warn!(error = %e, "REMOTE_UPLOAD_FAILED");
+            false
+        }
+    }
 }
 
 async fn upload_index_inner(
     db_path: &Path,
     config: &RemoteSyncConfig,
-    gcs_config: &xai_file_utils::TraceExportConfig,
-    auth_manager: Option<std::sync::Arc<crate::auth::AuthManager>>,
+    gcs_config: &TraceExportConfig,
+    auth_manager: Option<Arc<AuthManager>>,
 ) -> io::Result<()> {
     let db_path = db_path.to_path_buf();
     let compressed_path = db_path.with_extension("sqlite.zst.tmp");
@@ -239,12 +468,11 @@ async fn upload_index_inner(
     .await
     {
         Ok(_url) => {
-            record_upload();
             tracing::info!(
                 original_bytes = original_size,
                 compressed_bytes = compressed_size,
                 object_path = %object_path,
-                "search index uploaded to GCS"
+                "remote search index uploaded"
             );
         }
         Err(e) => {
@@ -266,20 +494,26 @@ async fn upload_index_inner(
 /// index is newer, it replaces the local `session_search.sqlite`.
 ///
 /// Returns `true` if a remote index was downloaded and installed.
-pub async fn maybe_download_index(
-    db_path: &Path,
-    config: &RemoteSyncConfig,
-    gcs_config: &xai_file_utils::TraceExportConfig,
-    auth_manager: Option<std::sync::Arc<crate::auth::AuthManager>>,
-) -> bool {
+pub async fn maybe_download_index(db_path: &Path, runtime: &RemoteSyncRuntime) -> bool {
+    let config = &runtime.config;
+    let gcs_config = &runtime.gcs_config;
+    let auth_manager = runtime.auth_manager.clone();
+
     if !config.enabled {
+        tracing::debug!("REMOTE_SYNC_DISABLED: download skipped");
         return false;
     }
 
     match download_index_inner(db_path, config, gcs_config, auth_manager).await {
-        Ok(downloaded) => downloaded,
+        Ok(downloaded) => {
+            if downloaded {
+                tracing::info!("REMOTE_DOWNLOAD_SUCCESS");
+            }
+            downloaded
+        }
         Err(e) => {
-            tracing::warn!(error = %e, "search index GCS download failed, falling back to local bootstrap");
+            tracing::warn!(error = %e, "REMOTE_DOWNLOAD_FAILED");
+            tracing::info!("LOCAL_FALLBACK");
             false
         }
     }
@@ -288,115 +522,97 @@ pub async fn maybe_download_index(
 async fn download_index_inner(
     db_path: &Path,
     config: &RemoteSyncConfig,
-    gcs_config: &xai_file_utils::TraceExportConfig,
-    auth_manager: Option<std::sync::Arc<crate::auth::AuthManager>>,
+    gcs_config: &TraceExportConfig,
+    auth_manager: Option<Arc<AuthManager>>,
 ) -> io::Result<bool> {
     let object_path = gcs_object_path(config);
 
-    // TODO: Implement GCS object metadata check (HEAD request) to get
-    // the remote object's last-modified timestamp. For now, use 0 which
-    // means "unknown" — `is_local_stale` will return false if we have a
-    // local bootstrap timestamp.
-    //
-    // When implemented, this should use the GCS JSON API:
-    // GET https://storage.googleapis.com/storage/v1/b/{bucket}/o/{object}
-    // to retrieve the `updated` field as the remote timestamp.
-    let remote_timestamp: i64 = 0;
-
-    if !is_local_stale(db_path, remote_timestamp) {
-        tracing::debug!("local search index is fresh, skipping remote download");
-        return Ok(false);
-    }
-
-    tracing::info!(
-        object_path = %object_path,
-        "local search index is stale, downloading from GCS"
-    );
-
-    // Download compressed index via GCS
-    // TODO: Use a proper GCS download API. For now, we attempt to
-    // construct a download URL and fetch via reqwest. This works for
-    // publicly readable buckets or when the user has ambient GCP
-    // credentials. For proxy-mode setups, a download-via-proxy helper
-    // would be needed (the existing upload helpers don't have a download
-    // counterpart).
-    let Some(bucket) = SEARCH_INDEX_BUCKET else {
-        tracing::debug!("no search index bucket compiled in, skipping remote download");
-        return Ok(false);
+    let remote = match probe_remote_metadata(&object_path, gcs_config, auth_manager.clone()).await {
+        Ok(RemoteProbe::NotFound) => {
+            tracing::info!(object_path = %object_path, "REMOTE_NOT_FOUND");
+            tracing::info!("LOCAL_FALLBACK");
+            return Ok(false);
+        }
+        Ok(RemoteProbe::Found(meta)) => meta,
+        Err(e) => {
+            tracing::warn!(error = %e, object_path = %object_path, "REMOTE_METADATA_FAILED");
+            tracing::info!("LOCAL_FALLBACK");
+            return Ok(false);
+        }
     };
-    let download_url = format!(
-        "https://storage.googleapis.com/storage/v1/b/{}/o/{}?alt=media",
-        bucket,
-        urlencoding::encode(&object_path),
-    );
 
-    let upload_config = crate::upload::gcs::WithAuth::with_auth(gcs_config, auth_manager);
-
-    // Try download via reqwest with proxy credentials if available.
-    // This is a best-effort path — if the bucket requires auth and
-    // we don't have the right credentials, it will fail gracefully.
-    let client = upload_config.proxy_http_client().unwrap_or_default();
-
-    let response = client
-        .get(&download_url)
-        .send()
-        .await
-        .map_err(|e| io::Error::other(format!("GCS download request failed: {e}")))?;
-
-    if !response.status().is_success() {
-        return Err(io::Error::other(format!(
-            "GCS download returned HTTP {}: object may not exist yet",
-            response.status()
-        )));
+    if !is_local_stale(db_path, remote.timestamp_unix) {
+        tracing::info!(
+            remote_timestamp_unix = remote.timestamp_unix,
+            "LOCAL_CURRENT"
+        );
+        return Ok(false);
     }
 
-    let compressed_bytes = response
-        .bytes()
-        .await
-        .map_err(|e| io::Error::other(format!("GCS download body read failed: {e}")))?;
-
-    // Write compressed data to temp file and decompress
-    let compressed_path = db_path.with_extension("sqlite.zst.download");
-    tokio::fs::write(&compressed_path, &compressed_bytes).await?;
-
-    let src = compressed_path.clone();
-    let dst = db_path.to_path_buf();
-    let dst_tmp = db_path.with_extension("sqlite.remote.tmp");
-    let dst_final = dst.clone();
-
-    tokio::task::spawn_blocking(move || -> io::Result<()> {
-        // Decompress to a temp file first, then atomically rename
-        decompress_file(&src, &dst_tmp)?;
-        // Atomic rename to avoid partial-file issues
-        std::fs::rename(&dst_tmp, &dst_final)?;
-        Ok(())
-    })
-    .await
-    .map_err(io::Error::other)??;
-
-    // Clean up compressed download
-    let _ = tokio::fs::remove_file(&compressed_path).await;
-
     tracing::info!(
-        compressed_bytes = compressed_bytes.len(),
-        "search index downloaded and installed from GCS"
+        remote_timestamp_unix = remote.timestamp_unix,
+        "REMOTE_NEWER"
     );
 
-    Ok(true)
+    let compressed_path = temp_sibling(db_path, "remote-zst");
+    let dst_tmp = temp_sibling(db_path, "remote-db");
+
+    let install_result = async {
+        download_compressed_to_path(
+            &object_path,
+            gcs_config,
+            auth_manager.clone(),
+            &compressed_path,
+        )
+        .await?;
+        let src = compressed_path.clone();
+        let dst_tmp_owned = dst_tmp.clone();
+        let dst_final = db_path.to_path_buf();
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            decompress_file(&src, &dst_tmp_owned)?;
+            std::fs::rename(&dst_tmp_owned, &dst_final)?;
+            Ok(())
+        })
+        .await
+        .map_err(io::Error::other)??;
+        Ok::<(), io::Error>(())
+    }
+    .await;
+
+    let _ = tokio::fs::remove_file(&compressed_path).await;
+    let _ = tokio::fs::remove_file(&dst_tmp).await;
+
+    install_result.map(|_| true)
 }
 
-// Proxy helpers
-
-/// Extension trait on `TraceExportConfigWithAuth` to expose `proxy_http_client`
-/// for download. This works because the upload gcs module already implements
-/// `StorageConfig` for the wrapper type.
-trait ProxyHttpClient {
-    fn proxy_http_client(&self) -> Option<reqwest::Client>;
+fn reset_upload_debounce_for_tests() {
+    let map = upload_debounce_map();
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard.clear();
 }
 
-impl ProxyHttpClient for crate::upload::gcs::TraceExportConfigWithAuth {
-    fn proxy_http_client(&self) -> Option<reqwest::Client> {
-        <Self as xai_file_utils::gcs::StorageConfig>::proxy_http_client(self)
+fn note_upload_for_tests(target: &str, ts: i64) {
+    let map = upload_debounce_map();
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard.insert(target.to_string(), ts);
+}
+
+fn last_upload_for_tests(target: &str) -> Option<i64> {
+    let map = upload_debounce_map();
+    let guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard.get(target).copied()
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_for_tests(
+    config: RemoteSyncConfig,
+    gcs_config: TraceExportConfig,
+    auth_manager: Option<Arc<AuthManager>>,
+) -> RemoteSyncRuntime {
+    RemoteSyncRuntime {
+        config,
+        gcs_config,
+        auth_manager,
     }
 }
 
@@ -553,9 +769,27 @@ mod tests {
 
     #[test]
     fn test_upload_debounce_initial() {
-        // On fresh process start (LAST_UPLOAD_AT == 0), debounce allows upload
-        // Note: can't reset the static in tests, but initial 0 → true
-        assert!(upload_debounce_ok());
+        reset_upload_debounce_for_tests();
+        assert!(upload_debounce_ok("t1"));
+        let now = chrono::Utc::now().timestamp();
+        note_upload_for_tests("t1", now);
+        assert!(!upload_debounce_ok("t1"));
+    }
+
+    #[test]
+    fn test_upload_debounce_isolated_by_target() {
+        reset_upload_debounce_for_tests();
+        let now = chrono::Utc::now().timestamp();
+        note_upload_for_tests("target-a", now);
+        assert!(!upload_debounce_ok("target-a"));
+        assert!(upload_debounce_ok("target-b"));
+    }
+
+    #[test]
+    fn test_upload_debounce_record_updates_timestamp() {
+        reset_upload_debounce_for_tests();
+        record_upload("target-z");
+        assert!(last_upload_for_tests("target-z").is_some());
     }
 
     #[test]

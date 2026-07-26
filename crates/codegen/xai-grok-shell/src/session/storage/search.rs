@@ -109,7 +109,7 @@ struct SessionSearchKey {
 
 enum SearchIndexJob {
     Upsert(SessionSearchKey),
-    BootstrapAll,
+    BootstrapAll(Option<search_remote_sync::RemoteSyncRuntime>),
     /// Dispatched for every `BootstrapOnce` after the first: re-verify the
     /// on-disk completed-bootstrap marker, then either clear the eager
     /// `bootstrapping` flag (index intact) or re-run the full bootstrap
@@ -192,7 +192,17 @@ impl SearchIndexManager {
                     }
                     SearchManagerCmd::BootstrapOnce { root } => {
                         if state.bootstrapped.insert(root.clone()) {
-                            Self::dispatch(&mut state, root, SearchIndexJob::BootstrapAll);
+                            let remote_sync = search_remote_sync::resolve_runtime();
+                            if let Some(ref runtime) = remote_sync {
+                                let db_path = search_db_path(&root);
+                                let _ = search_remote_sync::maybe_download_index(&db_path, runtime)
+                                    .await;
+                            }
+                            Self::dispatch(
+                                &mut state,
+                                root,
+                                SearchIndexJob::BootstrapAll(remote_sync),
+                            );
                         } else {
                             // Already bootstrapped this process — but the DB
                             // is shared, so don't trust the in-memory flag:
@@ -395,8 +405,8 @@ async fn handle_job(
         SearchIndexJob::Upsert(key) => {
             pending.insert(key, Instant::now() + debounce);
         }
-        SearchIndexJob::BootstrapAll => {
-            if let Err(e) = reindex_all(root_dir, storage).await {
+        SearchIndexJob::BootstrapAll(remote_sync) => {
+            if let Err(e) = reindex_all(root_dir, storage, remote_sync.as_ref()).await {
                 tracing::warn!(error = %e, "session search bootstrap failed");
                 clear_bootstrapping_flag();
             }
@@ -411,7 +421,8 @@ async fn handle_job(
                 tracing::info!(
                     "session search index missing completed-bootstrap marker; re-running bootstrap"
                 );
-                if let Err(e) = reindex_all(root_dir, storage).await {
+                let remote_sync = search_remote_sync::resolve_runtime();
+                if let Err(e) = reindex_all(root_dir, storage, remote_sync.as_ref()).await {
                     tracing::warn!(error = %e, "session search re-bootstrap failed");
                     clear_bootstrapping_flag();
                 }
@@ -557,7 +568,11 @@ async fn delete_session(root_dir: &Path, session_id: &str) -> io::Result<()> {
     .map_err(io::Error::other)?
 }
 
-async fn reindex_all(root_dir: &Path, storage: &dyn StorageAdapter) -> io::Result<()> {
+async fn reindex_all(
+    root_dir: &Path,
+    storage: &dyn StorageAdapter,
+    remote_sync: Option<&search_remote_sync::RemoteSyncRuntime>,
+) -> io::Result<()> {
     let config = BootstrapConfig::default();
     let progress = &SEARCH_INDEX_MANAGER.progress;
 
@@ -781,6 +796,10 @@ async fn reindex_all(root_dir: &Path, storage: &dyn StorageAdapter) -> io::Resul
     let db_path_meta = search_db_path(root_dir);
     if let Err(e) = search_remote_sync::write_last_bootstrap_at(&db_path_meta) {
         tracing::warn!(error = %e, "failed to write last_bootstrap_at metadata");
+    }
+
+    if let Some(runtime) = remote_sync {
+        let _ = search_remote_sync::maybe_upload_index(db_path_meta, runtime).await;
     }
 
     Ok(())
