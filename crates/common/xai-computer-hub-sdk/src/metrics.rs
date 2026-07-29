@@ -77,6 +77,17 @@ mod inner {
         .expect("computer_hub_client_reconnects_by_cause_total must register once")
     });
 
+    static DISCONNECT_DETAIL_CLASS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "computer_hub_client_disconnect_detail_class_total",
+            "Disconnects with a transport error detail, by cause (transport_read_error |\
+             transport_write_error) and bounded detail_class (connection_reset | \
+             broken_pipe | unexpected_eof | timeout | connection_aborted | other).",
+            &["cause", "detail_class"]
+        )
+        .expect("computer_hub_client_disconnect_detail_class_total must register once")
+    });
+
     static RECONNECT_GAP_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
         register_histogram!(
             "computer_hub_client_reconnect_gap_seconds",
@@ -378,6 +389,12 @@ mod inner {
         RECONNECTS_BY_CAUSE_TOTAL.with_label_values(&[cause]).inc();
     }
 
+    pub(crate) fn disconnect_detail_class(cause: &str, detail_class: &str) {
+        DISCONNECT_DETAIL_CLASS_TOTAL
+            .with_label_values(&[cause, detail_class])
+            .inc();
+    }
+
     pub(crate) fn reconnect_gap_observe(secs: f64) {
         RECONNECT_GAP_SECONDS.observe(secs);
     }
@@ -604,6 +621,7 @@ mod inner {
     pub(crate) fn reconnect_duration_observe(_secs: f64) {}
     pub(crate) fn reconnect_backoff_delay_observe(_secs: f64) {}
     pub(crate) fn reconnect_cause(_cause: &str) {}
+    pub(crate) fn disconnect_detail_class(_cause: &str, _detail_class: &str) {}
     pub(crate) fn reconnect_gap_observe(_secs: f64) {}
     pub(crate) fn call_dispatch_observe(_secs: f64) {}
     pub(crate) fn demux_inbox_depth_set(_depth: i64) {}
@@ -699,6 +717,7 @@ pub(crate) use inner::cancel_hook_received;
 pub(crate) use inner::cancel_no_target;
 pub(crate) use inner::cancel_pending_tombstoned;
 pub(crate) use inner::demux_inbox_depth_set;
+pub(crate) use inner::disconnect_detail_class;
 pub(crate) use inner::early_notif_buffered;
 pub(crate) use inner::evict_drain_completed;
 pub(crate) use inner::evict_drain_duration_observe;
