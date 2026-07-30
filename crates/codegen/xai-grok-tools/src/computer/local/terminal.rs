@@ -85,6 +85,73 @@ const MAX_RETAINED_OUTPUT_FILE_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 /// only, no output), so 100 entries is ~10 KB.
 const MAX_COMPLETED_TASK_SNAPSHOTS: usize = 100;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpensiveRunKey {
+    workspace: String,
+    command_identity: String,
+}
+
+fn normalize_workspace(path: &std::path::Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+fn normalize_command_identity(command: &str) -> String {
+    let mut normalized = String::with_capacity(command.len() + 8);
+    for ch in command.chars() {
+        match ch {
+            ';' => {
+                normalized.push(' ');
+                normalized.push(';');
+                normalized.push(' ');
+            }
+            '\n' | '\r' | '\t' => normalized.push(' '),
+            _ => normalized.push(ch),
+        }
+    }
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_expensive_command(command: &str) -> bool {
+    let trimmed = command.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let mut tokens = trimmed.split_whitespace();
+    let Some(first) = tokens.next().map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    if first == "cargo" || first.ends_with("/cargo") || first.ends_with("/cargo.exe") {
+        return true;
+    }
+    if first == "rustup" {
+        let t1 = tokens.next().map(str::to_ascii_lowercase);
+        let t2 = tokens.next().map(str::to_ascii_lowercase);
+        return matches!((t1.as_deref(), t2.as_deref()), (Some("run"), Some("cargo")));
+    }
+    false
+}
+
+fn expensive_run_key(command: &str, cwd: &std::path::Path) -> Option<ExpensiveRunKey> {
+    if !is_expensive_command(command) {
+        return None;
+    }
+    Some(ExpensiveRunKey {
+        workspace: normalize_workspace(cwd),
+        command_identity: normalize_command_identity(command),
+    })
+}
+
+fn unix_seconds(t: std::time::SystemTime) -> u64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn notification_interval() -> Duration {
     Duration::from_millis(DEFAULT_NOTIFICATION_INTERVAL_MS)
 }
@@ -304,6 +371,10 @@ struct ProcessState {
     /// subagent teardown only kills the subagent's own tasks.
     owner_session_id: Option<String>,
     description: Option<String>,
+    /// Stable run identifier for command coordination diagnostics.
+    run_id: String,
+    /// Workspace+command key for expensive-command single-flight checks.
+    expensive_run_key: Option<ExpensiveRunKey>,
 }
 
 impl ProcessState {
@@ -1013,11 +1084,69 @@ impl LocalTerminalActor {
         group
     }
 
+    async fn find_active_expensive_duplicate(
+        &mut self,
+        key: &ExpensiveRunKey,
+    ) -> Option<(
+        String,
+        String,
+        Option<String>,
+        std::time::SystemTime,
+        Option<u32>,
+    )> {
+        let dup_task_id = self
+            .processes
+            .iter()
+            .find(|(_, p)| p.exit_status.is_none() && p.expensive_run_key.as_ref() == Some(key))
+            .map(|(id, _)| id.clone())?;
+
+        // Opportunistic stale-state recovery: if the process already exited,
+        // force one poll to reap it before deciding whether to reject.
+        self.poll_process(&dup_task_id).await;
+
+        let process = self.processes.get(&dup_task_id)?;
+        if process.exit_status.is_some() {
+            return None;
+        }
+
+        Some((
+            dup_task_id,
+            process.run_id.clone(),
+            process.owner_session_id.clone(),
+            process.start_wall_time,
+            process.child.id(),
+        ))
+    }
+
     async fn handle_run(
         &mut self,
         request: TerminalRunRequest,
         reply: oneshot::Sender<Result<TerminalRunResult, ComputerError>>,
     ) {
+        let expensive_key = expensive_run_key(&request.command, &request.working_directory);
+        if let Some(ref key) = expensive_key
+            && let Some((task_id, run_id, owner, started_at, pid)) =
+                self.find_active_expensive_duplicate(key).await
+        {
+            tracing::warn!(
+                target: "terminal.command_coordination",
+                workspace = %key.workspace,
+                command_identity = %key.command_identity,
+                existing_task_id = %task_id,
+                run_id = %run_id,
+                owner_session_id = ?owner,
+                started_at_unix = unix_seconds(started_at),
+                pid = ?pid,
+                "Duplicate expensive command suppressed"
+            );
+            let msg = format!(
+                "Expensive command is already running for this workspace. run_id={run_id}, task_id={task_id}, owner_session_id={owner:?}, started_at_unix={}, pid={pid:?}",
+                unix_seconds(started_at)
+            );
+            let _ = reply.send(Err(ComputerError::io(msg)));
+            return;
+        }
+
         // Generate an internal ID — foreground callers never see this; the reply
         // goes back on the oneshot channel.
         let internal_id = uuid::Uuid::now_v7().to_string();
@@ -1093,7 +1222,21 @@ impl LocalTerminalActor {
             state_dump_handle,
             owner_session_id: request.owner_session_id.clone(),
             description: request.description.filter(|d| !d.trim().is_empty()),
+            run_id: internal_id.clone(),
+            expensive_run_key: expensive_key.clone(),
         };
+
+        if let Some(ref key) = expensive_key {
+            tracing::info!(
+                target: "terminal.command_coordination",
+                workspace = %key.workspace,
+                command_identity = %key.command_identity,
+                run_id = %internal_id,
+                owner_session_id = ?request.owner_session_id,
+                started_at_unix = unix_seconds(process_state.start_wall_time),
+                "Expensive command started"
+            );
+        }
 
         // Send an initial empty notification so the TUI shows the execution
         // timer immediately, before any stdout/stderr output arrives.
@@ -1150,6 +1293,30 @@ impl LocalTerminalActor {
         request: TerminalRunRequest,
         reply: oneshot::Sender<Result<BackgroundHandle, ComputerError>>,
     ) {
+        let expensive_key = expensive_run_key(&request.command, &request.working_directory);
+        if let Some(ref key) = expensive_key
+            && let Some((task_id, run_id, owner, started_at, pid)) =
+                self.find_active_expensive_duplicate(key).await
+        {
+            tracing::warn!(
+                target: "terminal.command_coordination",
+                workspace = %key.workspace,
+                command_identity = %key.command_identity,
+                existing_task_id = %task_id,
+                run_id = %run_id,
+                owner_session_id = ?owner,
+                started_at_unix = unix_seconds(started_at),
+                pid = ?pid,
+                "Duplicate expensive background command suppressed"
+            );
+            let msg = format!(
+                "Expensive command is already running for this workspace. run_id={run_id}, task_id={task_id}, owner_session_id={owner:?}, started_at_unix={}, pid={pid:?}",
+                unix_seconds(started_at)
+            );
+            let _ = reply.send(Err(ComputerError::io(msg)));
+            return;
+        }
+
         // Background commands fork the current shell state but don't update it on exit.
         let SpawnResult {
             child,
@@ -1237,7 +1404,21 @@ impl LocalTerminalActor {
             },
             owner_session_id: request.owner_session_id.clone(),
             description: request.description.filter(|d| !d.trim().is_empty()),
+            run_id: task_id.clone(),
+            expensive_run_key: expensive_key.clone(),
         };
+
+        if let Some(ref key) = expensive_key {
+            tracing::info!(
+                target: "terminal.command_coordination",
+                workspace = %key.workspace,
+                command_identity = %key.command_identity,
+                run_id = %task_id,
+                owner_session_id = ?request.owner_session_id,
+                started_at_unix = unix_seconds(process_state.start_wall_time),
+                "Expensive background command started"
+            );
+        }
 
         // Store under task_id — this is the key that get_task/kill_task will use
         let pid = process_state.child.id();
@@ -4860,6 +5041,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_parse_login_env_capture() {
         let stdout = "motd noise\n\x01/opt/rc/bin:/usr/bin\x01\
@@ -4890,6 +5072,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_parse_login_env_capture_path_only() {
         let (path, env) = parse_login_env_capture("\x01/usr/bin\x01");
@@ -4970,6 +5153,291 @@ mod tests {
             .await
             .expect("wait_for_completion should return evicted task");
         assert!(snap_wait.completed);
+    }
+
+    #[tokio::test]
+    async fn expensive_command_duplicate_rejected_in_same_workspace() {
+        let backend = LocalTerminalBackend::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let first = TerminalRunRequest {
+            command: "cargo --version; sleep 60".to_string(),
+            working_directory: tmp.path().to_path_buf(),
+            env: HashMap::new(),
+            timeout: Duration::from_secs(300),
+            output_byte_limit: 10000,
+            output_file: tmp.path().join("dup-1.log"),
+            notification_handle: ToolNotificationHandle::noop(),
+            tool_call_id: "dup-1".to_string(),
+            display_command: None,
+            auto_background_on_timeout: false,
+            foreground_block_budget: None,
+            kind: TaskKind::Bash,
+            owner_session_id: Some("session-a".to_string()),
+            description: None,
+        };
+
+        let h1 = backend
+            .run_background(first)
+            .await
+            .expect("first expensive command should start");
+
+        let duplicate = TerminalRunRequest {
+            command: "cargo   --version ;   sleep 60".to_string(),
+            working_directory: tmp.path().to_path_buf(),
+            env: HashMap::new(),
+            timeout: Duration::from_secs(300),
+            output_byte_limit: 10000,
+            output_file: tmp.path().join("dup-2.log"),
+            notification_handle: ToolNotificationHandle::noop(),
+            tool_call_id: "dup-2".to_string(),
+            display_command: None,
+            auto_background_on_timeout: false,
+            foreground_block_budget: None,
+            kind: TaskKind::Bash,
+            owner_session_id: Some("session-b".to_string()),
+            description: None,
+        };
+
+        let err = match backend.run_background(duplicate).await {
+            Ok(_) => panic!("duplicate expensive command should be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("already running"),
+            "duplicate rejection should explain active ownership, got: {err}"
+        );
+
+        let _ = backend.kill_task(&h1.task_id).await;
+    }
+
+    #[tokio::test]
+    async fn expensive_command_allows_parallelism_across_workspaces() {
+        let backend = LocalTerminalBackend::new();
+        let a = tempfile::TempDir::new().unwrap();
+        let b = tempfile::TempDir::new().unwrap();
+
+        let req_a = TerminalRunRequest {
+            command: "cargo --version; sleep 60".to_string(),
+            working_directory: a.path().to_path_buf(),
+            env: HashMap::new(),
+            timeout: Duration::from_secs(300),
+            output_byte_limit: 10000,
+            output_file: a.path().join("a.log"),
+            notification_handle: ToolNotificationHandle::noop(),
+            tool_call_id: "ws-a".to_string(),
+            display_command: None,
+            auto_background_on_timeout: false,
+            foreground_block_budget: None,
+            kind: TaskKind::Bash,
+            owner_session_id: Some("session-a".to_string()),
+            description: None,
+        };
+        let req_b = TerminalRunRequest {
+            command: "cargo --version; sleep 60".to_string(),
+            working_directory: b.path().to_path_buf(),
+            env: HashMap::new(),
+            timeout: Duration::from_secs(300),
+            output_byte_limit: 10000,
+            output_file: b.path().join("b.log"),
+            notification_handle: ToolNotificationHandle::noop(),
+            tool_call_id: "ws-b".to_string(),
+            display_command: None,
+            auto_background_on_timeout: false,
+            foreground_block_budget: None,
+            kind: TaskKind::Bash,
+            owner_session_id: Some("session-b".to_string()),
+            description: None,
+        };
+
+        let h1 = backend
+            .run_background(req_a)
+            .await
+            .expect("workspace A command should start");
+        let h2 = backend
+            .run_background(req_b)
+            .await
+            .expect("workspace B command should start independently");
+
+        let _ = backend.kill_task(&h1.task_id).await;
+        let _ = backend.kill_task(&h2.task_id).await;
+    }
+
+    #[tokio::test]
+    async fn expensive_command_can_restart_after_cancel() {
+        let backend = LocalTerminalBackend::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let req1 = TerminalRunRequest {
+            command: "cargo --version; sleep 60".to_string(),
+            working_directory: tmp.path().to_path_buf(),
+            env: HashMap::new(),
+            timeout: Duration::from_secs(300),
+            output_byte_limit: 10000,
+            output_file: tmp.path().join("restart-1.log"),
+            notification_handle: ToolNotificationHandle::noop(),
+            tool_call_id: "restart-1".to_string(),
+            display_command: None,
+            auto_background_on_timeout: false,
+            foreground_block_budget: None,
+            kind: TaskKind::Bash,
+            owner_session_id: Some("session-a".to_string()),
+            description: None,
+        };
+
+        let h1 = backend
+            .run_background(req1)
+            .await
+            .expect("first run should start");
+        let _ = backend.kill_task(&h1.task_id).await;
+
+        let req2 = TerminalRunRequest {
+            command: "cargo --version; sleep 60".to_string(),
+            working_directory: tmp.path().to_path_buf(),
+            env: HashMap::new(),
+            timeout: Duration::from_secs(300),
+            output_byte_limit: 10000,
+            output_file: tmp.path().join("restart-2.log"),
+            notification_handle: ToolNotificationHandle::noop(),
+            tool_call_id: "restart-2".to_string(),
+            display_command: None,
+            auto_background_on_timeout: false,
+            foreground_block_budget: None,
+            kind: TaskKind::Bash,
+            owner_session_id: Some("session-b".to_string()),
+            description: None,
+        };
+
+        let h2 = backend
+            .run_background(req2)
+            .await
+            .expect("cancelled run should not leave stale duplicate state");
+        let _ = backend.kill_task(&h2.task_id).await;
+    }
+
+    #[tokio::test]
+    async fn expensive_command_spawn_failure_does_not_hold_guard() {
+        let backend = LocalTerminalBackend::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let failing = TerminalRunRequest {
+            command: "cargo --version".to_string(),
+            working_directory: tmp.path().join("missing"),
+            env: HashMap::new(),
+            timeout: Duration::from_secs(30),
+            output_byte_limit: 10000,
+            output_file: tmp.path().join("fail.log"),
+            notification_handle: ToolNotificationHandle::noop(),
+            tool_call_id: "fail-1".to_string(),
+            display_command: None,
+            auto_background_on_timeout: false,
+            foreground_block_budget: None,
+            kind: TaskKind::Bash,
+            owner_session_id: Some("session-a".to_string()),
+            description: None,
+        };
+
+        if backend.run_background(failing).await.is_ok() {
+            panic!("spawn should fail for missing cwd");
+        }
+
+        let succeeding = TerminalRunRequest {
+            command: "cargo --version; sleep 60".to_string(),
+            working_directory: tmp.path().to_path_buf(),
+            env: HashMap::new(),
+            timeout: Duration::from_secs(300),
+            output_byte_limit: 10000,
+            output_file: tmp.path().join("success.log"),
+            notification_handle: ToolNotificationHandle::noop(),
+            tool_call_id: "success-1".to_string(),
+            display_command: None,
+            auto_background_on_timeout: false,
+            foreground_block_budget: None,
+            kind: TaskKind::Bash,
+            owner_session_id: Some("session-a".to_string()),
+            description: None,
+        };
+
+        let h = backend
+            .run_background(succeeding)
+            .await
+            .expect("failed startup must release expensive-command guard");
+        let _ = backend.kill_task(&h.task_id).await;
+    }
+
+    #[tokio::test]
+    async fn expensive_command_completion_records_exit_code() {
+        let backend = LocalTerminalBackend::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let request = TerminalRunRequest {
+            command: "cargo --version".to_string(),
+            working_directory: tmp.path().to_path_buf(),
+            env: HashMap::new(),
+            timeout: Duration::from_secs(30),
+            output_byte_limit: 10000,
+            output_file: tmp.path().join("done.log"),
+            notification_handle: ToolNotificationHandle::noop(),
+            tool_call_id: "done-1".to_string(),
+            display_command: None,
+            auto_background_on_timeout: false,
+            foreground_block_budget: None,
+            kind: TaskKind::Bash,
+            owner_session_id: Some("session-a".to_string()),
+            description: None,
+        };
+
+        let h = backend
+            .run_background(request)
+            .await
+            .expect("expensive command should start");
+        let snapshot = backend
+            .wait_for_completion(&h.task_id, Some(Duration::from_secs(30)))
+            .await
+            .expect("expensive command should complete");
+        assert!(snapshot.completed, "completed snapshot expected");
+        assert_eq!(snapshot.exit_code, Some(0), "exit code should be recorded");
+    }
+
+    #[tokio::test]
+    async fn expensive_command_completed_status_recoverable_after_eviction() {
+        let ttl = Duration::from_millis(150);
+        let backend = LocalTerminalBackend::new_with_completed_task_ttl(ttl);
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let request = TerminalRunRequest {
+            command: "cargo --version".to_string(),
+            working_directory: tmp.path().to_path_buf(),
+            env: HashMap::new(),
+            timeout: Duration::from_secs(30),
+            output_byte_limit: 10000,
+            output_file: tmp.path().join("recover.log"),
+            notification_handle: ToolNotificationHandle::noop(),
+            tool_call_id: "recover-1".to_string(),
+            display_command: None,
+            auto_background_on_timeout: false,
+            foreground_block_budget: None,
+            kind: TaskKind::Bash,
+            owner_session_id: Some("session-a".to_string()),
+            description: None,
+        };
+
+        let h = backend
+            .run_background(request)
+            .await
+            .expect("expensive command should start");
+        let _ = backend
+            .wait_for_completion(&h.task_id, Some(Duration::from_secs(30)))
+            .await
+            .expect("expensive command should complete");
+        tokio::time::sleep(ttl + Duration::from_millis(250)).await;
+
+        let recovered = backend
+            .get_task(&h.task_id)
+            .await
+            .expect("completed status should be recoverable after eviction");
+        assert!(recovered.completed);
+        assert_eq!(recovered.exit_code, Some(0));
     }
 
     // -----------------------------------------------------------------------
