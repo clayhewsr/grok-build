@@ -1,13 +1,11 @@
-//! GCS-based remote index sync for session search.
+//! Bootstrap-marker helpers for the session search index.
 //!
-//! On bootstrap completion, compresses `session_search.sqlite` with zstd
-//! and uploads to GCS (async, fire-and-forget, debounced to at most once
-//! per hour). On startup, if the local index is stale (missing, no
-//! `last_bootstrap_at`, or `last_bootstrap_at` > 1 hour older than remote),
-//! downloads and decompresses the remote index before running incremental
-//! bootstrap.
+//! Tracks `last_bootstrap_at` in the search index's sqlite meta table so
+//! `search.rs` can tell a completed bootstrap from an interrupted one.
 //!
-//! Gated behind `RemoteSyncConfig::enabled` (default false).
+//! This module previously also implemented GCS-based remote index sync
+//! (zstd upload/download of `session_search.sqlite`). That path had no
+//! callers and was removed; only the marker helpers remain.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -32,6 +30,7 @@ const UPLOAD_DEBOUNCE: Duration = Duration::from_secs(3600);
 /// Staleness threshold: if local `last_bootstrap_at` is more than this
 /// duration older than the remote object's timestamp, download the remote.
 const STALENESS_THRESHOLD: Duration = Duration::from_secs(3600);
+use super::search_fts::SessionSearchIndex;
 
 /// SQLite meta key for the last successful bootstrap timestamp (unix secs).
 const META_KEY_LAST_BOOTSTRAP: &str = "last_bootstrap_at";
@@ -626,7 +625,6 @@ pub(crate) fn runtime_for_tests(
 }
 
 // Tests
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -807,17 +805,29 @@ mod tests {
         let db_path = tmp.path().join("session_search.sqlite");
 
         // Before writing, should be None
-        assert_eq!(read_last_bootstrap_at(&db_path), None);
+        assert_eq!(try_read_last_bootstrap_at(&db_path).unwrap(), None);
 
         // Create DB and write timestamp
         write_last_bootstrap_at(&db_path).unwrap();
 
         // Should now have a reasonable timestamp
-        let ts = read_last_bootstrap_at(&db_path).unwrap();
+        let ts = try_read_last_bootstrap_at(&db_path).unwrap().unwrap();
         let now = chrono::Utc::now().timestamp();
         assert!(
             (now - ts).abs() < 5,
             "timestamp should be within 5 seconds of now"
         );
+    }
+
+    #[test]
+    fn test_clear_last_bootstrap_at() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("session_search.sqlite");
+
+        write_last_bootstrap_at(&db_path).unwrap();
+        assert!(try_read_last_bootstrap_at(&db_path).unwrap().is_some());
+
+        clear_last_bootstrap_at(&db_path).unwrap();
+        assert_eq!(try_read_last_bootstrap_at(&db_path).unwrap(), None);
     }
 }
