@@ -3,6 +3,7 @@ pub(crate) mod manager;
 pub(crate) mod notify;
 pub(crate) mod registry;
 pub(crate) mod schema_contract;
+pub(crate) mod staged;
 pub(crate) mod store;
 pub(crate) mod tracker;
 

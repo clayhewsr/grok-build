@@ -1124,7 +1124,7 @@ impl LocalTerminalActor {
         let dup_task_id = self
             .processes
             .iter()
-            .find(|(_, p)| p.exit_status.is_none() && p.expensive_run_key.as_ref() == Some(key))
+            .find(|(_, p)| !p.lifecycle.has_exited() && p.expensive_run_key.as_ref() == Some(key))
             .map(|(id, _)| id.clone())?;
 
         // Opportunistic stale-state recovery: if the process already exited,
@@ -1132,7 +1132,7 @@ impl LocalTerminalActor {
         self.poll_process(&dup_task_id).await;
 
         let process = self.processes.get(&dup_task_id)?;
-        if process.exit_status.is_some() {
+        if process.lifecycle.has_exited() {
             return None;
         }
 

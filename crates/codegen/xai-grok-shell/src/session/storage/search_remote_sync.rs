@@ -30,7 +30,6 @@ const UPLOAD_DEBOUNCE: Duration = Duration::from_secs(3600);
 /// Staleness threshold: if local `last_bootstrap_at` is more than this
 /// duration older than the remote object's timestamp, download the remote.
 const STALENESS_THRESHOLD: Duration = Duration::from_secs(3600);
-use super::search_fts::SessionSearchIndex;
 
 /// SQLite meta key for the last successful bootstrap timestamp (unix secs).
 const META_KEY_LAST_BOOTSTRAP: &str = "last_bootstrap_at";
