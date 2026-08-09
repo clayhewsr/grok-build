@@ -51,7 +51,7 @@ fn session_loaded_with_restore_shows_summary_in_scrollback() {
     assert!(
         effects
             .iter()
-            .any(|e| matches!(e, Effect::HydrateSessionTitleFromDisk { .. }))
+            .any(|e| matches!(e, Effect::HydrateSessionMetaFromDisk { .. }))
     );
     assert!(
         effects
@@ -87,9 +87,11 @@ fn session_title_hydration_auto_leaves_display_name_none() {
     );
     let id = AgentId(0);
     dispatch(
-        Action::TaskComplete(TaskResult::SessionTitleFromDisk {
+        Action::TaskComplete(TaskResult::SessionMetaFromDisk {
             agent_id: id,
             title: Some(("Auto Title".into(), false)),
+            last_turn_summary: None,
+            last_turn_summary_gen: 0,
         }),
         &mut app,
     );
@@ -112,9 +114,11 @@ fn session_title_hydration_manual_restores_display_name_cold_cache_only() {
     );
     let id = AgentId(0);
     dispatch(
-        Action::TaskComplete(TaskResult::SessionTitleFromDisk {
+        Action::TaskComplete(TaskResult::SessionMetaFromDisk {
             agent_id: id,
             title: Some(("Disk Title".into(), true)),
+            last_turn_summary: None,
+            last_turn_summary_gen: 0,
         }),
         &mut app,
     );
@@ -125,9 +129,11 @@ fn session_title_hydration_manual_restores_display_name_cold_cache_only() {
     }
     app.agents.get_mut(&id).unwrap().display_name = Some("Fresh Rename".into());
     dispatch(
-        Action::TaskComplete(TaskResult::SessionTitleFromDisk {
+        Action::TaskComplete(TaskResult::SessionMetaFromDisk {
             agent_id: id,
             title: Some(("Stale Disk Title".into(), true)),
+            last_turn_summary: None,
+            last_turn_summary_gen: 0,
         }),
         &mut app,
     );
@@ -147,15 +153,85 @@ fn session_title_hydration_ignores_blank_title() {
     );
     let id = AgentId(0);
     dispatch(
-        Action::TaskComplete(TaskResult::SessionTitleFromDisk {
+        Action::TaskComplete(TaskResult::SessionMetaFromDisk {
             agent_id: id,
             title: Some(("   ".into(), true)),
+            last_turn_summary: None,
+            last_turn_summary_gen: 0,
         }),
         &mut app,
     );
     let agent = &app.agents[&id];
     assert!(agent.display_name.is_none());
     assert!(agent.generated_session_title.is_none());
+}
+/// The persisted last-turn summary hydrates cold-cache only: a value already
+/// set by a live `LastTurnSummary` delivery (always newer than any disk read)
+/// must not be overwritten by the slower disk result.
+#[test]
+fn last_turn_summary_hydration_is_cold_cache_only() {
+    let mut app = test_app();
+    dispatch(
+        Action::LoadSession("sess-title".into(), None, false),
+        &mut app,
+    );
+    let id = AgentId(0);
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionMetaFromDisk {
+            agent_id: id,
+            title: None,
+            last_turn_summary: Some("From disk".into()),
+            last_turn_summary_gen: 0,
+        }),
+        &mut app,
+    );
+    assert_eq!(
+        app.agents[&id].last_turn_summary.as_deref(),
+        Some("From disk")
+    );
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .set_last_turn_summary(Some("Live delivery".into()));
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionMetaFromDisk {
+            agent_id: id,
+            title: None,
+            last_turn_summary: Some("Stale disk read".into()),
+            last_turn_summary_gen: 0,
+        }),
+        &mut app,
+    );
+    assert_eq!(
+        app.agents[&id].last_turn_summary.as_deref(),
+        Some("Live delivery"),
+        "hydration is a cold-cache fallback, never an overwrite"
+    );
+}
+/// A rewind that clears `last_turn_summary` while disk hydration is in flight
+/// must not be undone by the late pre-rewind `summary.json` value.
+#[test]
+fn last_turn_summary_hydration_does_not_restore_after_rewind_clear() {
+    let mut app = test_app();
+    dispatch(
+        Action::LoadSession("sess-title".into(), None, false),
+        &mut app,
+    );
+    let id = AgentId(0);
+    app.agents.get_mut(&id).unwrap().set_last_turn_summary(None);
+    dispatch(
+        Action::TaskComplete(TaskResult::SessionMetaFromDisk {
+            agent_id: id,
+            title: None,
+            last_turn_summary: Some("Pre-rewind disk summary".into()),
+            last_turn_summary_gen: 0,
+        }),
+        &mut app,
+    );
+    assert_eq!(
+        app.agents[&id].last_turn_summary, None,
+        "stale disk hydrate must not re-apply a summary rewind already cleared"
+    );
 }
 /// A resumed session whose replay left entries marked running (bg tasks,
 /// scheduler runs, tools cut off when the previous process died) must
@@ -196,6 +272,58 @@ fn session_loaded_without_adoption_finishes_replayed_running_entries() {
         !agent.scrollback.has_running_entries(),
         "replayed running entries must be finished when no turn is adopted"
     );
+}
+/// Resume into a cwd with `.git/grok-worktree-source` sets `session.is_worktree`.
+#[test]
+fn load_session_marks_standalone_worktree_cwd() {
+    let mut app = test_app();
+    let main = crate::test_util::TempGitRepo::init("main-only");
+    let clone = main.standalone_clone("wt-branch");
+    dispatch(
+        Action::LoadSession("sess-wt".into(), Some(clone.path.clone()), false),
+        &mut app,
+    );
+    assert!(
+        app.agents[&AgentId(0)].session.is_worktree,
+        "resume into a standalone grok worktree must set session.is_worktree"
+    );
+    assert_eq!(app.agents[&AgentId(0)].session.cwd, clone.path);
+}
+#[test]
+fn load_session_plain_repo_is_not_worktree() {
+    let mut app = test_app();
+    let repo = crate::test_util::TempGitRepo::init("main");
+    dispatch(
+        Action::LoadSession("sess-plain-git".into(), Some(repo.path.clone()), false),
+        &mut app,
+    );
+    assert!(!app.agents[&AgentId(0)].session.is_worktree);
+}
+#[test]
+fn remote_restore_marks_standalone_worktree_cwd() {
+    let mut app = test_app();
+    let main = crate::test_util::TempGitRepo::init("main-only");
+    let clone = main.standalone_clone("wt-branch");
+    app.cwd = clone.path.clone();
+    let _ = dispatch_load_session_with_restore(
+        &mut app,
+        "remote-wt".into(),
+        clone.path.display().to_string(),
+    );
+    assert!(app.agents[&AgentId(0)].session.is_worktree);
+    assert_eq!(app.agents[&AgentId(0)].session.cwd, clone.path);
+}
+#[test]
+fn remote_restore_plain_repo_is_not_worktree() {
+    let mut app = test_app();
+    let repo = crate::test_util::TempGitRepo::init("main");
+    app.cwd = repo.path.clone();
+    let _ = dispatch_load_session_with_restore(
+        &mut app,
+        "remote-plain".into(),
+        repo.path.display().to_string(),
+    );
+    assert!(!app.agents[&AgentId(0)].session.is_worktree);
 }
 /// Cross-cwd resume anchors the agent cwd to the resolved origin cwd.
 #[test]
@@ -439,7 +567,7 @@ fn session_loaded_without_restore_no_summary() {
     assert!(
         effects
             .iter()
-            .any(|e| matches!(e, Effect::HydrateSessionTitleFromDisk { .. }))
+            .any(|e| matches!(e, Effect::HydrateSessionMetaFromDisk { .. }))
     );
     assert!(
         effects
