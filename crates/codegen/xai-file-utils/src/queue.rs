@@ -609,6 +609,9 @@ pub enum EnqueueOutcome {
     Failed { reason: String },
     /// An identical `gcs_path` was already in flight, so this enqueue was skipped.
     Deduplicated,
+    /// The caller skipped enqueue on purpose (e.g. collect deadline). Not a
+    /// queue failure; after-turn reduction must not treat this as `Failed`.
+    Skipped { reason: String },
 }
 /// Internal outcome of [`UploadQueue::enqueue_core`], the shared body behind
 /// [`UploadQueue::enqueue`] and [`UploadQueue::enqueue_bytes_blocking`].
@@ -1126,6 +1129,7 @@ impl UploadQueue {
             remove_owned_source(&rejected.source, Some(&self.stats));
             self.stats.pending.fetch_sub(1, Ordering::Relaxed);
             self.stats.pending_bytes.fetch_sub(size, Ordering::Relaxed);
+            self.stats.enqueued.fetch_sub(1, Ordering::Relaxed);
             self.stats.notify_transition();
             self.stats.enqueue_fallbacks.fetch_add(1, Ordering::Relaxed);
             self.spawn_inline_upload_from_path(
@@ -1216,6 +1220,7 @@ impl UploadQueue {
             self.stats
                 .pending_bytes
                 .fetch_sub(original_size, Ordering::Relaxed);
+            self.stats.enqueued.fetch_sub(1, Ordering::Relaxed);
             self.stats.notify_transition();
             return Err(anyhow::anyhow!("Upload queue closed"));
         }
@@ -1362,6 +1367,7 @@ impl UploadQueue {
             self.stats
                 .pending_bytes
                 .fetch_sub(disk_bytes, Ordering::Relaxed);
+            self.stats.enqueued.fetch_sub(1, Ordering::Relaxed);
             self.stats.notify_transition();
             self.stats.enqueue_fallbacks.fetch_add(1, Ordering::Relaxed);
             self.spawn_inline_upload_owned_snapshot(
@@ -2634,7 +2640,7 @@ fn dir_size(path: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 #[cfg(test)]
-mod tests {
+mod local_tests {
     use super::*;
     use crate::UploadMethod;
     /// Mock credential resolver for tests.
@@ -6971,3 +6977,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "queue_tests.rs"]
+mod tests;

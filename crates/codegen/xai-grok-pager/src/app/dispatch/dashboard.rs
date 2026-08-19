@@ -136,6 +136,14 @@ pub(super) fn dispatch_open_dashboard(app: &mut AppView) -> Vec<Effect> {
         app.show_toast("Sign in to open the dashboard");
         return vec![];
     }
+    // Same for the terms notice: opening the dashboard would dismiss it unanswered.
+    if matches!(
+        app.consent_state,
+        crate::app::consent::ConsentState::Pending { .. }
+    ) {
+        app.show_toast("Answer the terms notice to open the dashboard");
+        return vec![];
+    }
     // Same rationale for folder trust: opening the dashboard would visually
     // dismiss the trust question with the folder still unanswered. Toast and
     // stay put (mirrors the auth gate above) so the question is resolved first.
@@ -192,7 +200,7 @@ pub(super) fn dispatch_open_dashboard(app: &mut AppView) -> Vec<Effect> {
             && let Some(agent) = app.agents.get_mut(&id)
         {
             agent.current_branch = info.branch;
-            agent.is_worktree = info.is_worktree;
+            agent.is_worktree = info.is_worktree || agent.session.is_worktree;
             agent.main_repo = info.main_repo;
             agent.worktree_label = info.worktree_label;
         }
@@ -307,7 +315,7 @@ fn rearm_session_overlay(app: &mut AppView, id: AgentId) {
         },
         None => {
             if let Some(agent) = app.agents.get_mut(&id) {
-                agent.active_subagent = None;
+                agent.close_subagent_fullscreen();
             }
             DashboardRowId::TopLevel(id)
         }
@@ -350,7 +358,7 @@ pub(super) fn dispatch_dashboard_attach(
                 // Drop any prior subagent takeover so the agent
                 // view paints the parent, not whatever subagent
                 // the user last opened fullscreen.
-                agent.active_subagent = None;
+                agent.close_subagent_fullscreen();
             }
             if let Some(d) = app.dashboard.as_mut() {
                 // `focus_row` (not a bare `selected` assignment) so the
@@ -1087,7 +1095,7 @@ pub(super) fn dispatch_dashboard_overlay_cycle(app: &mut AppView, delta: i32) ->
     // Drop any prior subagent takeover on the next agent so the
     // overlay paints the parent view, mirroring the attach path.
     if let Some(agent) = app.agents.get_mut(&next_id) {
-        agent.active_subagent = None;
+        agent.close_subagent_fullscreen();
     }
     // A stop-confirm armed on the CURRENT agent must not carry over to
     // the next one — a mouse click on `[‹]` / `[›]` lands here without
@@ -1833,19 +1841,7 @@ pub(super) fn dispatch_dashboard_begin_rename(app: &mut AppView) {
 }
 
 fn rename_prefill_title(agent: &AgentView) -> String {
-    if let Some(name) = agent.display_name.as_deref() {
-        let trimmed = name.trim();
-        if !trimmed.is_empty() {
-            return crate::views::session_title::sanitize_display_text(trimmed).into_owned();
-        }
-    }
-    if let Some(title) = agent.generated_session_title.as_deref() {
-        let trimmed = title.trim();
-        if !trimmed.is_empty() {
-            return crate::views::session_title::sanitize_display_text(trimmed).into_owned();
-        }
-    }
-    String::new()
+    crate::views::session_title::rename_source_title(agent).unwrap_or_default()
 }
 
 pub(super) fn dispatch_dashboard_commit_rename(app: &mut AppView) -> Vec<Effect> {
@@ -1877,6 +1873,7 @@ pub(super) fn dispatch_dashboard_commit_rename(app: &mut AppView) -> Vec<Effect>
                 session_id,
                 title,
                 cwd,
+                kind: agent.rename_kind(),
             });
         } else {
             agent.display_name = Some(title);
@@ -2071,7 +2068,7 @@ fn stop_top_level_activity(agent: &mut crate::app::agent_view::AgentView) -> Opt
                 agent,
                 session_id.clone(),
                 /* cancel_subagents */ true,
-                /* rewind_if_no_output */ false,
+                /* rewind_prompt_id */ None,
             ));
         }
         let running: Vec<String> = agent
@@ -2089,6 +2086,7 @@ fn stop_top_level_activity(agent: &mut crate::app::agent_view::AgentView) -> Opt
             effects.push(Effect::KillBgTask {
                 session_id: session_id.clone(),
                 task_id,
+                source: xai_grok_shell::extensions::task::TaskKillSource::Teardown,
             });
         }
         let scheduled: Vec<String> = agent.session.scheduled_tasks.keys().cloned().collect();

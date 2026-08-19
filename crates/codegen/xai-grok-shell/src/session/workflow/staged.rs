@@ -789,6 +789,7 @@ fn ensure_acyclic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     fn stage(id: &str, prerequisites: &[&str], class: StageExecutionClass) -> StageDefinition {
         StageDefinition {
@@ -806,6 +807,324 @@ mod tests {
 
     fn op(defs: Vec<StageDefinition>) -> StagedOperation {
         StagedOperation::new("op-1".to_string(), "sess-1".to_string(), defs).expect("valid op")
+    }
+
+    fn deployment_stage(
+        id: &str,
+        prerequisites: &[&str],
+        class: StageExecutionClass,
+        checkpoint_ref: Option<&str>,
+        compensation_action: Option<&str>,
+    ) -> StageDefinition {
+        StageDefinition {
+            stage_id: id.to_string(),
+            prerequisites: prerequisites.iter().map(|v| v.to_string()).collect(),
+            execution_class: class,
+            checkpoint_ref: checkpoint_ref.map(str::to_string),
+            compensation_action: compensation_action.map(str::to_string),
+        }
+    }
+
+    fn deployment_definitions() -> Vec<StageDefinition> {
+        vec![
+            deployment_stage(
+                "validate-configuration",
+                &[],
+                StageExecutionClass::Reversible,
+                Some("checkpoint:config-validated"),
+                Some("rollback-config-validation"),
+            ),
+            deployment_stage(
+                "build-application",
+                &["validate-configuration"],
+                StageExecutionClass::Reversible,
+                None,
+                Some("rollback-build"),
+            ),
+            deployment_stage(
+                "run-safety-checks",
+                &["build-application"],
+                StageExecutionClass::Reversible,
+                Some("checkpoint:safety-passed"),
+                Some("rollback-safety-checks"),
+            ),
+            deployment_stage(
+                "publish-release-artifact",
+                &["run-safety-checks"],
+                StageExecutionClass::Irreversible,
+                None,
+                None,
+            ),
+            deployment_stage(
+                "update-production-routing",
+                &["publish-release-artifact"],
+                StageExecutionClass::Reversible,
+                None,
+                Some("rollback-production-routing"),
+            ),
+            deployment_stage(
+                "verify-production-health",
+                &["update-production-routing"],
+                StageExecutionClass::Reversible,
+                None,
+                Some("rollback-health-verification"),
+            ),
+        ]
+    }
+
+    fn deployment_op(operation_id: &str) -> StagedOperation {
+        StagedOperation::new(
+            operation_id.to_string(),
+            "demo-owner".to_string(),
+            deployment_definitions(),
+        )
+        .expect("valid staged deployment")
+    }
+
+    fn status_name(status: StageStatus) -> &'static str {
+        match status {
+            StageStatus::Pending => "PENDING",
+            StageStatus::Ready => "READY",
+            StageStatus::Running => "RUNNING",
+            StageStatus::Succeeded => "SUCCEEDED",
+            StageStatus::Failed => "FAILED",
+            StageStatus::Blocked => "BLOCKED",
+            StageStatus::Compensating => "COMPENSATING",
+            StageStatus::Compensated => "COMPENSATED",
+            StageStatus::Cancelled => "CANCELLED",
+            StageStatus::ReviewRequired => "REVIEW_REQUIRED",
+        }
+    }
+
+    fn fmt_list(values: &[String]) -> String {
+        if values.is_empty() {
+            "none".to_string()
+        } else {
+            values.join(", ")
+        }
+    }
+
+    fn push_snapshot(report: &mut String, operation: &StagedOperation, action: &str) {
+        let snapshots = operation.snapshot();
+        let next = operation.legal_next_stages();
+        for stage in snapshots {
+            let prereqs = if stage.prerequisites.is_empty() {
+                "none".to_string()
+            } else {
+                stage.prerequisites.join(", ")
+            };
+            let blocked_reason = stage.blocked_reason.unwrap_or_else(|| "none".to_string());
+            let checkpoint = stage.checkpoint_ref.unwrap_or_else(|| "none".to_string());
+            let reversible = if stage.execution_class == StageExecutionClass::Reversible {
+                "YES"
+            } else {
+                "NO"
+            };
+            let recovery_action = stage
+                .compensation_action
+                .unwrap_or_else(|| "none".to_string());
+            writeln!(report, "OPERATION: {}", stage.operation_id).unwrap();
+            writeln!(report, "STAGE: {}", stage.stage_id).unwrap();
+            writeln!(report, "STATUS: {}", status_name(stage.status)).unwrap();
+            writeln!(report, "PREREQUISITES: {}", prereqs).unwrap();
+            writeln!(report, "BLOCKED REASON: {}", blocked_reason).unwrap();
+            writeln!(report, "CHECKPOINT: {}", checkpoint).unwrap();
+            writeln!(report, "REVERSIBLE: {}", reversible).unwrap();
+            writeln!(report, "ACTION: {}", action).unwrap();
+            writeln!(report, "RECOVERY ACTION: {}", recovery_action).unwrap();
+            writeln!(report, "NEXT LEGAL STAGES: {}", fmt_list(&next)).unwrap();
+            writeln!(report).unwrap();
+        }
+    }
+
+    fn operation_final_state(operation: &StagedOperation) -> &'static str {
+        let snapshots = operation.snapshot();
+        if snapshots
+            .iter()
+            .any(|s| s.status == StageStatus::ReviewRequired)
+        {
+            return "REVIEW_REQUIRED";
+        }
+        if snapshots.iter().any(|s| s.status == StageStatus::Failed) {
+            return "FAILED";
+        }
+        if snapshots.iter().all(|s| {
+            matches!(
+                s.status,
+                StageStatus::Succeeded | StageStatus::Compensated | StageStatus::Cancelled
+            )
+        }) {
+            return "SUCCEEDED";
+        }
+        "IN_PROGRESS"
+    }
+
+    fn render_staged_execution_demo_report() -> String {
+        let mut report = String::new();
+
+        writeln!(report, "CASE A - NORMAL SUCCESS").unwrap();
+        let mut case_a = deployment_op("deploy-case-a");
+        push_snapshot(&mut report, &case_a, "initial state");
+
+        let case_a_order = [
+            "validate-configuration",
+            "build-application",
+            "run-safety-checks",
+            "publish-release-artifact",
+            "update-production-routing",
+            "verify-production-health",
+        ];
+        let mut checkpoint_counter = 1;
+        for stage_id in case_a_order {
+            case_a
+                .start_stage(stage_id, "demo-owner", format!("a:start:{stage_id}"))
+                .expect("stage should be startable in case A");
+            case_a
+                .complete_stage(stage_id, format!("a:done:{stage_id}"))
+                .expect("stage should complete in case A");
+            if case_a
+                .snapshot()
+                .iter()
+                .any(|s| s.stage_id == stage_id && s.checkpoint_ref.is_some())
+            {
+                let cp = case_a.create_checkpoint(
+                    format!("case-a-cp-{checkpoint_counter}"),
+                    format!("a:checkpoint:{checkpoint_counter}"),
+                );
+                checkpoint_counter += 1;
+                writeln!(report, "CHECKPOINT CAPTURED: {}", cp.checkpoint_id).unwrap();
+            }
+            push_snapshot(
+                &mut report,
+                &case_a,
+                &format!("completed stage {stage_id} in case A"),
+            );
+        }
+        writeln!(report, "FINAL STATE: {}", operation_final_state(&case_a)).unwrap();
+        writeln!(report).unwrap();
+
+        writeln!(report, "CASE B - FORCED FAILURE AND RECOVERY").unwrap();
+        let mut case_b = deployment_op("deploy-case-b");
+        for stage_id in [
+            "validate-configuration",
+            "build-application",
+            "run-safety-checks",
+            "publish-release-artifact",
+            "update-production-routing",
+        ] {
+            case_b
+                .start_stage(stage_id, "demo-owner", format!("b:start:{stage_id}"))
+                .expect("stage should start in case B preamble");
+            case_b
+                .complete_stage(stage_id, format!("b:done:{stage_id}"))
+                .expect("stage should complete in case B preamble");
+        }
+        case_b
+            .start_stage(
+                "verify-production-health",
+                "demo-owner",
+                "b:start:verify-production-health".to_string(),
+            )
+            .expect("health stage should start in case B");
+        case_b
+            .fail_stage(
+                "verify-production-health",
+                "b:failed:verify-production-health".to_string(),
+                "forced failure: health endpoint returned 503".to_string(),
+            )
+            .expect("health stage should fail in case B");
+        push_snapshot(
+            &mut report,
+            &case_b,
+            "forced verify-production-health failure",
+        );
+
+        case_b.prepare_recovery("forced production health failure");
+        let mut recovery_order = Vec::new();
+        while let Some(stage_id) = case_b.start_next_compensation(
+            "demo-owner",
+            format!("b:comp:start:{}", recovery_order.len()),
+        ) {
+            recovery_order.push(stage_id.clone());
+            case_b
+                .finish_compensation(
+                    &stage_id,
+                    format!("b:comp:done:{stage_id}"),
+                    true,
+                    Some(format!("compensated {stage_id}")),
+                )
+                .expect("compensation should complete in case B");
+        }
+        writeln!(report, "RECOVERY ORDER: {}", fmt_list(&recovery_order)).unwrap();
+        push_snapshot(&mut report, &case_b, "post-recovery snapshot");
+        writeln!(report, "FINAL STATE: {}", operation_final_state(&case_b)).unwrap();
+        writeln!(report).unwrap();
+
+        writeln!(report, "CASE C - INTERRUPTION AND RESUME").unwrap();
+        let mut case_c = deployment_op("deploy-case-c");
+        for stage_id in [
+            "validate-configuration",
+            "build-application",
+            "run-safety-checks",
+        ] {
+            case_c
+                .start_stage(stage_id, "demo-owner", format!("c:start:{stage_id}"))
+                .expect("stage should start before interruption");
+            case_c
+                .complete_stage(stage_id, format!("c:done:{stage_id}"))
+                .expect("stage should complete before interruption");
+        }
+        let resume_cp = case_c.create_checkpoint(
+            "case-c-safety-checkpoint".to_string(),
+            "c:checkpoint".to_string(),
+        );
+        writeln!(report, "CHECKPOINT CAPTURED: {}", resume_cp.checkpoint_id).unwrap();
+
+        let mut resumed = deployment_op("deploy-case-c");
+        resumed
+            .restore_checkpoint(&resume_cp)
+            .expect("resume checkpoint should restore");
+        push_snapshot(
+            &mut report,
+            &resumed,
+            "resumed from safety checkpoint; completed stages must not repeat",
+        );
+
+        for stage_id in [
+            "publish-release-artifact",
+            "update-production-routing",
+            "verify-production-health",
+        ] {
+            resumed
+                .start_stage(stage_id, "demo-owner", format!("c:resume:start:{stage_id}"))
+                .expect("resumed stage should start");
+            resumed
+                .complete_stage(stage_id, format!("c:resume:done:{stage_id}"))
+                .expect("resumed stage should complete");
+        }
+        push_snapshot(&mut report, &resumed, "resumed execution completed");
+        writeln!(report, "FINAL STATE: {}", operation_final_state(&resumed)).unwrap();
+        writeln!(report).unwrap();
+
+        writeln!(report, "CASE D - DRY RUN").unwrap();
+        let case_d = deployment_op("deploy-case-d");
+        let dry = case_d.dry_run_plan();
+        writeln!(report, "OPERATION: {}", dry.operation_id).unwrap();
+        writeln!(report, "ACTION: dry-run only (no stage execution)").unwrap();
+        writeln!(report, "ORDERED STAGES: {}", fmt_list(&dry.ordered_stages)).unwrap();
+        writeln!(report, "NEXT LEGAL STAGES: {}", fmt_list(&dry.ready_stages)).unwrap();
+        writeln!(report, "REVERSIBLE STAGES: {}", fmt_list(&dry.reversible_stages)).unwrap();
+        writeln!(report, "IRREVERSIBLE STAGES: {}", fmt_list(&dry.irreversible_stages)).unwrap();
+        writeln!(report, "CHECKPOINT LOCATIONS: {}", fmt_list(&dry.checkpoint_candidates)).unwrap();
+        writeln!(report, "EXPECTED COMPENSATION ORDER: {}", fmt_list(&dry.recovery_sequence)).unwrap();
+        for (stage_id, reason) in &dry.blocked_stages {
+            writeln!(report, "STAGE: {stage_id}").unwrap();
+            writeln!(report, "STATUS: BLOCKED").unwrap();
+            writeln!(report, "BLOCKED REASON: {reason}").unwrap();
+        }
+        writeln!(report, "FINAL STATE: {}", operation_final_state(&case_d)).unwrap();
+
+        report
     }
 
     #[test]
@@ -1077,5 +1396,173 @@ mod tests {
         let first = op.snapshot();
         let second = op.snapshot();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn simulation_normal_success_completes_all_stages() {
+        let mut op = deployment_op("sim-success");
+        for stage_id in [
+            "validate-configuration",
+            "build-application",
+            "run-safety-checks",
+            "publish-release-artifact",
+            "update-production-routing",
+            "verify-production-health",
+        ] {
+            op.start_stage(stage_id, "demo-owner", format!("sim:start:{stage_id}"))
+                .unwrap();
+            op.complete_stage(stage_id, format!("sim:done:{stage_id}"))
+                .unwrap();
+        }
+        assert!(
+            op.snapshot()
+                .iter()
+                .all(|s| s.status == StageStatus::Succeeded)
+        );
+        assert_eq!(operation_final_state(&op), "SUCCEEDED");
+    }
+
+    #[test]
+    fn simulation_blocked_prerequisite_reporting() {
+        let mut op = deployment_op("sim-blocked");
+        let err = op
+            .start_stage(
+                "build-application",
+                "demo-owner",
+                "sim:block:start".to_string(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StagedOperationError::StageNotExecutable(_)));
+        let stage = op
+            .snapshot()
+            .into_iter()
+            .find(|s| s.stage_id == "build-application")
+            .unwrap();
+        assert_eq!(stage.status, StageStatus::Blocked);
+        assert!(
+            stage
+                .blocked_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("validate-configuration"))
+        );
+    }
+
+    #[test]
+    fn simulation_forced_failure_triggers_ordered_recovery() {
+        let mut op = deployment_op("sim-recovery");
+        for stage_id in [
+            "validate-configuration",
+            "build-application",
+            "run-safety-checks",
+            "publish-release-artifact",
+            "update-production-routing",
+        ] {
+            op.start_stage(stage_id, "demo-owner", format!("sim-r:start:{stage_id}"))
+                .unwrap();
+            op.complete_stage(stage_id, format!("sim-r:done:{stage_id}"))
+                .unwrap();
+        }
+        op.start_stage(
+            "verify-production-health",
+            "demo-owner",
+            "sim-r:start:verify-production-health".to_string(),
+        )
+        .unwrap();
+        op.fail_stage(
+            "verify-production-health",
+            "sim-r:fail:verify-production-health".to_string(),
+            "forced verification failure".to_string(),
+        )
+        .unwrap();
+
+        op.prepare_recovery("forced verification failure");
+        let mut compensation_order = Vec::new();
+        while let Some(stage_id) = op.start_next_compensation(
+            "demo-owner",
+            format!("sim-r:comp:start:{}", compensation_order.len()),
+        ) {
+            compensation_order.push(stage_id.clone());
+            op.finish_compensation(
+                &stage_id,
+                format!("sim-r:comp:done:{stage_id}"),
+                true,
+                Some("simulated rollback".to_string()),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            compensation_order.first().map(String::as_str),
+            Some("update-production-routing")
+        );
+        let publish = op
+            .snapshot()
+            .into_iter()
+            .find(|s| s.stage_id == "publish-release-artifact")
+            .unwrap();
+        assert_eq!(publish.status, StageStatus::ReviewRequired);
+        assert_eq!(operation_final_state(&op), "REVIEW_REQUIRED");
+    }
+
+    #[test]
+    fn simulation_checkpoint_resume_does_not_repeat_completed() {
+        let mut before = deployment_op("sim-resume");
+        for stage_id in [
+            "validate-configuration",
+            "build-application",
+            "run-safety-checks",
+        ] {
+            before
+                .start_stage(stage_id, "demo-owner", format!("sim-c:start:{stage_id}"))
+                .unwrap();
+            before
+                .complete_stage(stage_id, format!("sim-c:done:{stage_id}"))
+                .unwrap();
+        }
+        let cp = before.create_checkpoint("sim-cp".to_string(), "sim-c:checkpoint".to_string());
+
+        let mut resumed = deployment_op("sim-resume");
+        resumed.restore_checkpoint(&cp).unwrap();
+        assert_eq!(
+            resumed.legal_next_stages(),
+            vec!["publish-release-artifact".to_string()]
+        );
+
+        for stage_id in [
+            "validate-configuration",
+            "build-application",
+            "run-safety-checks",
+        ] {
+            let stage = resumed
+                .snapshot()
+                .into_iter()
+                .find(|s| s.stage_id == stage_id)
+                .unwrap();
+            assert_eq!(stage.status, StageStatus::Succeeded);
+            assert_eq!(stage.attempt_count, 1);
+        }
+    }
+
+    #[test]
+    fn simulation_dry_run_performs_no_execution() {
+        let op = deployment_op("sim-dry-run");
+        let plan = op.dry_run_plan();
+        assert_eq!(
+            plan.ready_stages,
+            vec!["validate-configuration".to_string()]
+        );
+        let snapshots = op.snapshot();
+        assert!(snapshots.iter().all(|s| s.attempt_count == 0));
+        assert!(snapshots.iter().all(|s| s.started_at.is_none()));
+        assert!(snapshots.iter().all(|s| s.completed_at.is_none()));
+    }
+
+    #[test]
+    fn simulation_demo_report_covers_success_failure_resume_and_dry_run() {
+        let report = render_staged_execution_demo_report();
+        assert!(report.contains("CASE A - NORMAL SUCCESS"));
+        assert!(report.contains("CASE B - FORCED FAILURE AND RECOVERY"));
+        assert!(report.contains("CASE C - INTERRUPTION AND RESUME"));
+        assert!(report.contains("CASE D - DRY RUN"));
     }
 }

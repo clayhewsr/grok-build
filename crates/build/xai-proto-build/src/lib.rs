@@ -130,9 +130,7 @@ impl XaiProtoBuilder {
             let temp_dir = tempfile::TempDir::new()?;
             let depfile_path = temp_dir.path().join("protoc-deps.d");
             let descriptor_out_path = temp_dir.path().join("protoc-descriptor.pb");
-            let depfile_path_str = depfile_path
-                .to_str()
-                .context("depfile path not UTF-8")?;
+            let depfile_path_str = depfile_path.to_str().context("depfile path not UTF-8")?;
             let descriptor_out_path_str = descriptor_out_path
                 .to_str()
                 .context("descriptor path not UTF-8")?;
@@ -173,9 +171,7 @@ impl XaiProtoBuilder {
             let first_line = lines.next().context("protoc command output is empty")?;
             let prefix = format!("{descriptor_out_path_str}:");
             let rem = first_line.strip_prefix(&prefix).with_context(|| {
-                format!(
-                    "protoc command output must start with {prefix:?}: {output:?}"
-                )
+                format!("protoc command output must start with {prefix:?}: {output:?}")
             })?;
             for line in iter::once(rem).chain(lines) {
                 let line = line.trim();
@@ -325,13 +321,13 @@ impl XaiProtoBuilder {
 
 #[cfg(test)]
 mod tests {
-        use super::XaiProtoBuilder;
-        use std::fs;
-        use std::path::{Path, PathBuf};
+    use super::XaiProtoBuilder;
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
-        #[cfg(unix)]
-        fn write_fake_protoc(path: &Path) {
-                let script = r#"#!/bin/sh
+    #[cfg(unix)]
+    fn write_fake_protoc(path: &Path) {
+    let script = r#"#!/bin/sh
 dep=""
 desc=""
 proto=""
@@ -363,19 +359,19 @@ printf "%s: %s\n" "$desc" "$proto" > "$dep"
 : > "$desc"
 exit 0
 "#;
-                fs::write(path, script).unwrap();
-                #[cfg(unix)]
-                {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mut perms = fs::metadata(path).unwrap().permissions();
-                        perms.set_mode(0o755);
-                        fs::set_permissions(path, perms).unwrap();
-                }
-        }
+    fs::write(path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).unwrap();
+    }
+    }
 
-        #[cfg(windows)]
-        fn write_fake_protoc(path: &Path) {
-                let script = r#"@echo off
+    #[cfg(windows)]
+    fn write_fake_protoc(path: &Path) {
+    let script = r#"@echo off
 setlocal EnableExtensions
 set "dep="
 set "desc="
@@ -401,43 +397,43 @@ if "%proto%"=="" exit /b 95
 type nul > "%desc%"
 exit /b 0
 "#;
-                fs::write(path, script).unwrap();
-        }
+    fs::write(path, script).unwrap();
+    }
 
-        #[test]
-        fn emit_rerun_if_changed_uses_platform_neutral_outputs() {
-                let tmp = tempfile::TempDir::new().unwrap();
-                let include_dir = tmp.path().join("include");
-                fs::create_dir_all(&include_dir).unwrap();
+    #[test]
+    fn emit_rerun_if_changed_uses_platform_neutral_outputs() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let include_dir = tmp.path().join("include");
+    fs::create_dir_all(&include_dir).unwrap();
 
-                let proto = include_dir.join("sample.proto");
-                fs::write(&proto, "syntax = \"proto3\"; message A {}\n").unwrap();
+    let proto = include_dir.join("sample.proto");
+    fs::write(&proto, "syntax = \"proto3\"; message A {}\n").unwrap();
 
-                #[cfg(unix)]
-                let protoc = {
-                        let p = tmp.path().join("fake-protoc.sh");
-                        write_fake_protoc(&p);
-                        p
-                };
+    #[cfg(unix)]
+    let protoc = {
+        let p = tmp.path().join("fake-protoc.sh");
+        write_fake_protoc(&p);
+        p
+    };
 
-                #[cfg(windows)]
-                let protoc = {
-                        let p = tmp.path().join("fake-protoc.cmd");
-                        write_fake_protoc(&p);
-                        p
-                };
+    #[cfg(windows)]
+    let protoc = {
+        let p = tmp.path().join("fake-protoc.cmd");
+        write_fake_protoc(&p);
+        p
+    };
 
-                let protos: Vec<PathBuf> = vec![proto.clone()];
-                let includes: Vec<PathBuf> = vec![include_dir.clone()];
+    let protos: Vec<PathBuf> = vec![proto.clone()];
+    let includes: Vec<PathBuf> = vec![include_dir.clone()];
 
-                XaiProtoBuilder::emit_rerun_if_changed(
-                        Some(&protoc),
-                        None,
-                        protos.iter().map(PathBuf::as_path),
-                        includes.iter().map(PathBuf::as_path),
-                )
-                .unwrap();
-        }
+    XaiProtoBuilder::emit_rerun_if_changed(
+        Some(&protoc),
+        None,
+        protos.iter().map(PathBuf::as_path),
+        includes.iter().map(PathBuf::as_path),
+    )
+    .unwrap();
+    }
 }
 
 pub fn configure() -> XaiProtoBuilder {

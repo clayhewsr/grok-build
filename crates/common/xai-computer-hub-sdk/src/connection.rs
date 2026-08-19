@@ -1949,7 +1949,7 @@ fn jittered_backoff(base: Duration, attempt: u32, key: &ConnKey, entropy: u64) -
     Duration::from_millis(jittered_ms)
 }
 #[cfg(test)]
-mod tests {
+mod local_tests {
     use super::*;
     /// Window expected for the default table, using *literal* 1 s / 10 s
     /// so a change to [`RECONNECT_SPREAD_FLOOR`] or the cap is a
@@ -4961,3 +4961,7 @@ mod tests {
         conn.await_shutdown().await;
     }
 }
+
+#[cfg(test)]
+#[path = "connection_tests.rs"]
+mod tests;
