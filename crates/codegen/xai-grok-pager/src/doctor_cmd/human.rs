@@ -145,9 +145,31 @@ pub(super) fn format(report: &DiagnosticReport) -> String {
         }
     }
 
+    let windows_preflight = report
+        .probe_notes
+        .iter()
+        .filter(|note| crate::diagnostics::is_windows_preflight_probe(note.probe))
+        .collect::<Vec<_>>();
+    if !windows_preflight.is_empty() {
+        out.push_str("\nWindows Native Build Preflight\n");
+        for note in windows_preflight {
+            let message = match &note.message {
+                Some(message) => message.to_owned(),
+                None => probe_status(note.status).to_owned(),
+            };
+            row(
+                &mut out,
+                "·",
+                note.probe,
+                &format!("{}: {message}", probe_status(note.status)),
+            );
+        }
+    }
+
     let visible_notes = report
         .probe_notes
         .iter()
+        .filter(|note| !crate::diagnostics::is_windows_preflight_probe(note.probe))
         .filter(|note| !fact_already_shows_probe(note.probe));
     let mut notes = visible_notes.peekable();
     if notes.peek().is_some() {
@@ -250,6 +272,10 @@ fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
 
 fn probe_status(status: ProbeStatus) -> &'static str {
     match status {
+        ProbeStatus::Pass => "pass",
+        ProbeStatus::Warn => "warn",
+        ProbeStatus::Fail => "fail",
+        ProbeStatus::NotApplicable => "not_applicable",
         ProbeStatus::Unsupported => "unsupported",
         ProbeStatus::Unavailable => "unavailable",
         ProbeStatus::Error => "error",

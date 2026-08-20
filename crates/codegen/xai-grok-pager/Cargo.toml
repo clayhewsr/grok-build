@@ -165,7 +165,7 @@ core-foundation = { workspace = true }
 # events so only the relaunched child handles them. Version matches the other
 # in-repo consumers (xai-crash-handler, xai-system-power).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 xai-grok-pager-render = { path = "../xai-grok-pager-render", features = ["test-support"] }

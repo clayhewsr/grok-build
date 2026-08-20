@@ -10,12 +10,15 @@ use crate::notifications::{NotificationCondition, NotificationMethod};
 use crate::terminal::{ByobuBackend, MultiplexerKind, TerminalContext, TerminalName};
 use crate::theme::color_support::ColorLevel;
 
+mod build_preflight;
 mod doctor_format;
 mod fix;
 mod model;
 pub mod probes;
 mod view;
 
+pub use build_preflight::append_windows_native_build_preflight;
+pub(crate) use build_preflight::is_windows_preflight_probe;
 pub use doctor_format::format_doctor;
 #[cfg(test)]
 pub(crate) use fix::test_fix_plan;

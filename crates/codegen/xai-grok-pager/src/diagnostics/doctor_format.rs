@@ -135,6 +135,32 @@ pub fn format_doctor(report: &DiagnosticReport) -> String {
         }
     }
 
+    let windows_preflight = report
+        .probe_notes
+        .iter()
+        .filter(|note| super::is_windows_preflight_probe(note.probe))
+        .collect::<Vec<_>>();
+    if !windows_preflight.is_empty() {
+        out.push_str("\nWindows Native Build Preflight\n");
+        for note in windows_preflight {
+            let status = match note.status {
+                super::ProbeStatus::Pass => "pass",
+                super::ProbeStatus::Warn => "warn",
+                super::ProbeStatus::Fail => "fail",
+                super::ProbeStatus::NotApplicable => "not_applicable",
+                super::ProbeStatus::Unsupported => "unsupported",
+                super::ProbeStatus::Unavailable => "unavailable",
+                super::ProbeStatus::Error => "error",
+            };
+            match &note.message {
+                Some(message) => {
+                    out.push_str(&format!("  {}  {}: {message}\n", note.probe, status))
+                }
+                None => out.push_str(&format!("  {}  {status}\n", note.probe)),
+            }
+        }
+    }
+
     format_findings(report, &mut out);
     out
 }

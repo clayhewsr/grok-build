@@ -36,6 +36,9 @@ impl DoctorCommand {
             runtime.workspace,
         );
         let mut report = crate::diagnostics::view(snapshot.into());
+        if !cfg!(test) {
+            crate::diagnostics::append_windows_native_build_preflight(&mut report);
+        }
         crate::diagnostics::merge_tui_runtime_findings(&mut report, runtime_findings);
         report
     }

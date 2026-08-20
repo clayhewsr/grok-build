@@ -83,6 +83,9 @@ fn collect_report_with(
 ) -> DiagnosticReport {
     let mut report = crate::diagnostics::view(snapshot.into());
     crate::diagnostics::apply_voice_probe(&mut report, true);
+    if !cfg!(test) {
+        crate::diagnostics::append_windows_native_build_preflight(&mut report);
+    }
     report
 }
 

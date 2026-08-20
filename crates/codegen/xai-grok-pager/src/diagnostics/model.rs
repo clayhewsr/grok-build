@@ -236,6 +236,10 @@ pub(crate) fn probe_requires_live_tui(note: &ProbeNote) -> bool {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProbeStatus {
+    Pass,
+    Warn,
+    Fail,
+    NotApplicable,
     Unsupported,
     Unavailable,
     Error,

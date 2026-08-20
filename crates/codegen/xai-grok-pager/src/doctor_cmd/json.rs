@@ -460,6 +460,10 @@ pub(super) fn data_control(fact: DataControlFact) -> &'static str {
 
 pub(super) fn probe_status(status: ProbeStatus) -> &'static str {
     match status {
+        ProbeStatus::Pass => "pass",
+        ProbeStatus::Warn => "warn",
+        ProbeStatus::Fail => "fail",
+        ProbeStatus::NotApplicable => "not_applicable",
         ProbeStatus::Unsupported => "unsupported",
         ProbeStatus::Unavailable => "unavailable",
         ProbeStatus::Error => "error",

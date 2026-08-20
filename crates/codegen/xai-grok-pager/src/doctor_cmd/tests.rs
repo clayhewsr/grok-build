@@ -1048,3 +1048,32 @@ fn output_writer_errors_propagate() {
     assert!(write_report(&healthy_report(), false, &mut BrokenWriter).is_err());
     assert!(write_report(&healthy_report(), true, &mut BrokenWriter).is_err());
 }
+
+#[test]
+fn windows_preflight_note_formats_and_serializes() {
+    let mut report = healthy_report();
+    report.probe_notes.push(ProbeNote {
+        probe: "build.windows-native.overall",
+        status: ProbeStatus::Pass,
+        message: Some("all prerequisite checks passed".to_owned()),
+    });
+
+    let human_text = human::format(&report);
+    assert!(
+        human_text.contains("Windows Native Build Preflight"),
+        "{human_text}"
+    );
+    assert!(
+        human_text.contains("pass: all prerequisite checks passed"),
+        "{human_text}"
+    );
+
+    let mut output = Vec::new();
+    write_report(&report, true, &mut output).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        json["probeNotes"][0]["probe"],
+        "build.windows-native.overall"
+    );
+    assert_eq!(json["probeNotes"][0]["status"], "pass");
+}
