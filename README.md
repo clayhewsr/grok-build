@@ -82,6 +82,38 @@ The binary artifact is named `xai-grok-pager`; official installs ship it as
 `grok`. On first launch it opens your browser to authenticate — see the
 [authentication guide](crates/codegen/xai-grok-pager/docs/user-guide/02-authentication.md).
 
+## Custom Reliability & Tooling Upgrades
+
+This fork adds a small set of reliability-first integrations while preserving
+the upstream architecture and behavior model.
+
+### Grok Core Utility Belt
+
+Adds a unified capability-status layer that reports runtime availability across
+live Web/X tooling, Python/code execution, research/open-page capabilities, and
+vision/image analysis. Capability states are explicitly surfaced as
+AVAILABLE, UNAVAILABLE, DEGRADED, and PERMISSION_REQUIRED. Fallback logic is
+fail-closed: if a requested capability is unavailable, the system does not
+claim the tool executed and either uses a valid alternative or returns a
+precise blocked result.
+
+### Windows Native Build-Prerequisite Preflight
+
+Adds early Windows-focused diagnostics for native build prerequisites,
+including Rust/Cargo, MSVC, CMake, NASM, Git, and disk-space health. The
+preflight path is designed to classify environment blockers early so setup
+failures are distinguishable from feature/code regressions.
+
+### Dependency-Aware Staged Execution & Recovery
+
+Adds staged execution safeguards with prerequisite enforcement, legal next-step
+selection, checkpoints, interruption/resume, reverse-order
+recovery/compensation, dry-run planning, and review protection for
+irreversible actions.
+
+Custom additions are developed with focused crate-level validation and
+public-safe compatibility checks.
+
 ## Documentation
 
 Full online documentation is available at
