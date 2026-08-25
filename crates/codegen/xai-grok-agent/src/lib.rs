@@ -9,6 +9,7 @@ pub mod agent;
 pub mod builder;
 pub mod compaction;
 pub mod config;
+pub mod core_utility_belt;
 pub mod discovery;
 pub mod error;
 pub mod plugins;
@@ -24,6 +25,9 @@ pub use config::AgentDefinition;
 pub use config::preset_names;
 pub use config::toolset_for_preset;
 pub use config::workspace_grok_build_toolset;
+pub use core_utility_belt::{
+    CapabilityReport, CapabilityState, CoreUtilityBeltRegistry, FallbackDecision,
+};
 pub use error::AgentBuildError;
 pub use prompt::context::{DEFAULT_SYSTEM_PROMPT_LABEL, PromptContext};
 pub use system_reminder::ReminderPolicy;

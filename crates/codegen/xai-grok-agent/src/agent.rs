@@ -5,9 +5,14 @@ use std::sync::Arc;
 use xai_grok_sampling_types::HostedTool;
 use xai_grok_tools::bridge::ToolBridge;
 use xai_grok_tools::types::definition::ToolDefinition;
+use xai_grok_tools::types::tool::ToolKind;
 
 use crate::compaction::CompactionPolicy;
 use crate::config::{AgentDefinition, CompletionRequirement, PermissionMode};
+use crate::core_utility_belt::{
+    CoreUtilityBeltRegistry, FallbackDecision, UtilityBeltFacts, build_registry,
+    fallback_for_request,
+};
 use crate::prompt::context::PromptContext;
 use crate::system_reminder::ReminderPolicy;
 
@@ -193,6 +198,92 @@ impl Agent {
     /// Built-in tool definitions only (excludes MCP tools).
     pub async fn tool_definitions_builtins_only(&self) -> Vec<ToolDefinition> {
         self.tool_bridge.tool_definitions_builtins_only().await
+    }
+
+    /// Deterministic runtime capability snapshot for the focused core utility belt.
+    pub async fn core_utility_belt_registry(&self) -> CoreUtilityBeltRegistry {
+        let has_web_search = self
+            .tool_bridge
+            .tool_for_kind(ToolKind::WebSearch)
+            .await
+            .is_some()
+            || self
+                .hosted_tools
+                .iter()
+                .any(|t| matches!(t, HostedTool::WebSearch { .. }));
+        let has_x_search = self
+            .hosted_tools
+            .iter()
+            .any(|t| matches!(t, HostedTool::XSearch { .. }));
+        let has_execute = self
+            .tool_bridge
+            .tool_for_kind(ToolKind::Execute)
+            .await
+            .is_some();
+        let has_read = self
+            .tool_bridge
+            .tool_for_kind(ToolKind::Read)
+            .await
+            .is_some();
+        let has_web_fetch = self
+            .tool_bridge
+            .tool_for_kind(ToolKind::WebFetch)
+            .await
+            .is_some();
+        let has_search_tool = self
+            .tool_bridge
+            .tool_for_kind(ToolKind::SearchTool)
+            .await
+            .is_some();
+        let has_use_tool = self
+            .tool_bridge
+            .tool_for_kind(ToolKind::UseTool)
+            .await
+            .is_some();
+        let has_image_generation = self
+            .tool_bridge
+            .tool_for_kind(ToolKind::ImageGen)
+            .await
+            .is_some()
+            || self
+                .tool_bridge
+                .tool_for_kind(ToolKind::ImageToVideo)
+                .await
+                .is_some()
+            || self
+                .tool_bridge
+                .tool_for_kind(ToolKind::ReferenceToVideo)
+                .await
+                .is_some();
+
+        build_registry(UtilityBeltFacts {
+            has_web_search,
+            has_x_search,
+            has_execute,
+            has_read,
+            has_web_fetch,
+            has_search_tool,
+            has_use_tool,
+            has_image_generation,
+            permission_mode: self.definition.permission_mode.clone(),
+        })
+    }
+
+    /// Resolve a safe fallback plan when a requested utility-belt capability is
+    /// unavailable or degraded.
+    pub async fn core_utility_belt_fallback(
+        &self,
+        requested_capability: &str,
+        requested_action: &str,
+        alternatives: &[&str],
+    ) -> FallbackDecision {
+        let registry = self.core_utility_belt_registry().await;
+        fallback_for_request(
+            &registry,
+            requested_capability,
+            requested_action,
+            alternatives,
+        )
     }
 
     /// Whether auto-compact should trigger given current token usage.
