@@ -112,6 +112,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 tokio_util::sync::CancellationToken::new(),
             );
             let actor = Arc::new(SessionActor {
+                status_wake: Default::default(),
                 session_info,
                 auth_method_id: test_auth_method_id("test-auth"),
                 model_auth_memo: std::cell::RefCell::new(None),
@@ -140,7 +141,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
                 mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
                 delivery_tools: std::cell::RefCell::new(Vec::new()),
-                attach_non_interactive: std::cell::Cell::new(false),
+                attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
                 chat_state_handle,
                 unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
                 current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -201,6 +202,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 session_start: std::time::Instant::now(),
                 inference_idle_timeout: Duration::from_secs(300),
                 max_retries: 3,
+                rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
@@ -217,6 +219,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 agent: std::cell::RefCell::new(test_agent_default().await),
                 last_reported_branch: std::sync::Arc::new(parking_lot::Mutex::new(None)),
                 git_head_enabled: false,
+                status_line_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 models_manager: Default::default(),
                 display_cwd: std::sync::OnceLock::new(),
                 active_agent_type: parking_lot::Mutex::new(None),
@@ -306,6 +309,7 @@ async fn persist_ack_waits_for_disk_flush_before_success() {
                 turn_stream_drained: parking_lot::Mutex::new(None),
                 pending_image_strip: parking_lot::Mutex::new(None),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
+                sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
                 image_describe_cache: Arc::new(
@@ -598,6 +602,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
             };
             let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
             let actor = Arc::new(SessionActor {
+                status_wake: Default::default(),
                 session_info: session_info.clone(),
                 auth_method_id: test_auth_method_id("test-auth"),
                 model_auth_memo: std::cell::RefCell::new(None),
@@ -626,7 +631,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
                 mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
                 delivery_tools: std::cell::RefCell::new(Vec::new()),
-                attach_non_interactive: std::cell::Cell::new(false),
+                attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
                 chat_state_handle,
                 unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
                 current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -690,6 +695,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 session_start: std::time::Instant::now(),
                 inference_idle_timeout: Duration::from_secs(300),
                 max_retries: 3,
+                rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
@@ -706,6 +712,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 agent: std::cell::RefCell::new(test_agent_default().await),
                 last_reported_branch: std::sync::Arc::new(parking_lot::Mutex::new(None)),
                 git_head_enabled: false,
+                status_line_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 models_manager: Default::default(),
                 display_cwd: std::sync::OnceLock::new(),
                 active_agent_type: parking_lot::Mutex::new(None),
@@ -795,6 +802,7 @@ async fn first_turn_memory_injection_disabled_does_not_persist_to_chat_history()
                 turn_stream_drained: parking_lot::Mutex::new(None),
                 pending_image_strip: parking_lot::Mutex::new(None),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
+                sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
                 image_describe_cache: Arc::new(
@@ -895,6 +903,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 )
                 .await;
             let actor = SessionActor {
+                status_wake: Default::default(),
                 session_info: SessionInfo {
                     id: acp::SessionId::new("test-cancel"),
                     cwd: cwd.as_str().to_string(),
@@ -919,7 +928,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
                 mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
                 delivery_tools: std::cell::RefCell::new(Vec::new()),
-                attach_non_interactive: std::cell::Cell::new(false),
+                attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
                 chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
                 unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
                 current_prompt_id: std::sync::Arc::new(
@@ -990,6 +999,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 session_start: std::time::Instant::now(),
                 inference_idle_timeout: Duration::from_secs(300),
                 max_retries: 3,
+                rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
@@ -1006,6 +1016,9 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 agent: std::cell::RefCell::new(agent),
                 last_reported_branch: std::sync::Arc::new(parking_lot::Mutex::new(None)),
                 git_head_enabled: false,
+                status_line_enabled: std::sync::Arc::new(
+                    std::sync::atomic::AtomicBool::new(false),
+                ),
                 models_manager: Default::default(),
                 display_cwd: std::sync::OnceLock::new(),
                 active_agent_type: parking_lot::Mutex::new(None),
@@ -1112,6 +1125,7 @@ async fn cancel_running_task_teardown_clears_running_and_pending_work() {
                 turn_stream_drained: parking_lot::Mutex::new(None),
                 pending_image_strip: parking_lot::Mutex::new(None),
                 sampler_handle: xai_grok_sampler::SamplerHandle::noop(),
+                sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
                 image_describe_cache: Arc::new(
@@ -2432,6 +2446,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 )
                 .await;
             let actor = SessionActor {
+                status_wake: Default::default(),
                 session_info: SessionInfo {
                     id: acp::SessionId::new("test-cancel-sampler"),
                     cwd: cwd.as_str().to_string(),
@@ -2456,7 +2471,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
                 mcp_strategy: std::cell::Cell::new(McpInitStrategy::Blocking),
                 delivery_tools: std::cell::RefCell::new(Vec::new()),
-                attach_non_interactive: std::cell::Cell::new(false),
+                attach_non_interactive: std::rc::Rc::new(std::cell::Cell::new(false)),
                 chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
                 unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
                 current_prompt_id: std::sync::Arc::new(
@@ -2527,6 +2542,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 session_start: std::time::Instant::now(),
                 inference_idle_timeout: Duration::from_secs(300),
                 max_retries: 3,
+                rate_limit_waits: crate::session::acp_session::RateLimitWaitConfig::default(),
                 max_turns: None,
                 pending_interjections: InterjectionBuffer::new(),
                 pending_skill_reminders: Mutex::new(Vec::new()),
@@ -2543,6 +2559,9 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 agent: std::cell::RefCell::new(agent),
                 last_reported_branch: std::sync::Arc::new(parking_lot::Mutex::new(None)),
                 git_head_enabled: false,
+                status_line_enabled: std::sync::Arc::new(
+                    std::sync::atomic::AtomicBool::new(false),
+                ),
                 models_manager: Default::default(),
                 display_cwd: std::sync::OnceLock::new(),
                 active_agent_type: parking_lot::Mutex::new(None),
@@ -2649,6 +2668,7 @@ async fn cancel_propagates_to_sampler_handle_so_no_further_emission() {
                 turn_stream_drained: parking_lot::Mutex::new(None),
                 pending_image_strip: parking_lot::Mutex::new(None),
                 sampler_handle: sampler_handle.clone(),
+                sampling_gate: None,
                 rebuild_spec: crate::session::agent_rebuild::test_rebuild_spec_default(),
                 image_description_model: crate::test_support::TEST_MODEL.to_owned(),
                 image_describe_cache: Arc::new(
