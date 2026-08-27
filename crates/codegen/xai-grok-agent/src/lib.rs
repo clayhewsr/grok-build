@@ -12,6 +12,7 @@ pub mod config;
 pub mod core_utility_belt;
 pub mod discovery;
 pub mod error;
+pub mod field_boots;
 pub mod plugins;
 pub mod prompt;
 pub mod repo;
@@ -29,5 +30,10 @@ pub use core_utility_belt::{
     CapabilityReport, CapabilityState, CoreUtilityBeltRegistry, FallbackDecision,
 };
 pub use error::AgentBuildError;
+pub use field_boots::{
+    CapabilityReadiness, EvidenceFootprint, ExecutionReadinessState, ExecutionRoute,
+    FieldBootsDecision, FieldBootsRequest, KnownPrerequisite, RecoveryGrip, RouteDecision,
+    SafeStepMode, TerrainAwareness, TerrainInput, evaluate_field_boots,
+};
 pub use prompt::context::{DEFAULT_SYSTEM_PROMPT_LABEL, PromptContext};
 pub use system_reminder::ReminderPolicy;

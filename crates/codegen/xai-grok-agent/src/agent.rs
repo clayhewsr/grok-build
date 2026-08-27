@@ -13,6 +13,9 @@ use crate::core_utility_belt::{
     CoreUtilityBeltRegistry, FallbackDecision, UtilityBeltFacts, build_registry,
     fallback_for_request,
 };
+use crate::field_boots::{
+    FieldBootsDecision, FieldBootsRequest, TerrainInput, evaluate_field_boots,
+};
 use crate::prompt::context::PromptContext;
 use crate::system_reminder::ReminderPolicy;
 
@@ -284,6 +287,28 @@ impl Agent {
             requested_action,
             alternatives,
         )
+    }
+
+    /// Deterministic execution-environment readiness report for a requested action.
+    ///
+    /// This complements the Utility Belt by answering whether execution can
+    /// safely proceed right now, and by preserving a compact public-safe
+    /// evidence footprint.
+    pub async fn field_boots_decision(
+        &self,
+        terrain: TerrainInput,
+        request: FieldBootsRequest,
+    ) -> FieldBootsDecision {
+        let mut requested = request.required_tool_kinds.clone();
+        requested.sort_by_key(|kind| kind.as_key());
+        requested.dedup();
+        let mut available_kinds = Vec::new();
+        for kind in requested {
+            if self.tool_bridge.tool_for_kind(kind).await.is_some() {
+                available_kinds.push(kind);
+            }
+        }
+        evaluate_field_boots(terrain, request, &available_kinds)
     }
 
     /// Whether auto-compact should trigger given current token usage.
