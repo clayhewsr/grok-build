@@ -17,6 +17,7 @@
 //! The per-row sort key (state and last_change_at) is recomputed each frame; with single-digit agent counts in one pager process this is free.
 
 pub mod layout;
+mod mission_control;
 pub mod peek;
 pub mod peek_tail;
 pub mod render;

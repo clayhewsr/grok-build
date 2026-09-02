@@ -18,7 +18,7 @@ pub use types::*;
 
 use layout::{LayoutCache, StructuralScrollAnchor};
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::time::Instant;
 
@@ -26,7 +26,7 @@ use indexmap::IndexMap;
 use ratatui::layout::Rect;
 
 use super::block::{BlockContent, RenderBlock};
-use super::blocks::tool::{EditToolCallBlock, ToolCallBlock};
+use super::blocks::tool::{EditToolCallBlock, ToolCallBlock, VerbGroupKind};
 use super::entry::{EntryId, ScrollbackEntry};
 use super::layout::HorizontalLayout;
 use super::selection::SelectionBox;
@@ -46,6 +46,64 @@ enum DeferredWarmAbove {
     Idle,
     Deferred,
     Armed,
+}
+
+/// Public-safe execution ledger derived from scrollback tool calls.
+///
+/// This intentionally exposes counts and category buckets only; it never carries tool output, paths, or other raw evidence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VerificationLedgerSnapshot {
+    /// All tool-call entries seen in the scrollback, excluding lifecycle markers.
+    pub tool_calls: usize,
+    /// Tool calls that finished without an error.
+    pub verified: usize,
+    /// Tool calls that finished with an error.
+    pub failed: usize,
+    /// Tool calls that are still running.
+    pub pending: usize,
+    /// Per-kind buckets used by Mission Control to surface the most active execution lanes.
+    pub kind_counts: HashMap<VerbGroupKind, usize>,
+}
+
+impl VerificationLedgerSnapshot {
+    fn record_kind(&mut self, kind: Option<VerbGroupKind>) {
+        let Some(kind) = kind else {
+            return;
+        };
+        *self.kind_counts.entry(kind).or_insert(0) += 1;
+    }
+
+    fn record_entry(&mut self, entry: &ScrollbackEntry) {
+        let RenderBlock::ToolCall(tool_call) = &entry.block else {
+            return;
+        };
+
+        self.record_kind(tool_call.label_kind());
+        self.tool_calls += 1;
+        if entry.is_running {
+            self.pending += 1;
+        } else if tool_call.is_success() {
+            self.verified += 1;
+        } else {
+            self.failed += 1;
+        }
+    }
+
+    /// Return the most active tool kinds, highest-count first.
+    pub fn top_kinds(&self, limit: usize) -> Vec<(VerbGroupKind, usize)> {
+        let mut kinds: Vec<(VerbGroupKind, usize)> = self
+            .kind_counts
+            .iter()
+            .map(|(kind, count)| (*kind, *count))
+            .collect();
+        kinds.sort_by(|(kind_a, count_a), (kind_b, count_b)| {
+            count_b
+                .cmp(count_a)
+                .then_with(|| kind_a.verb(false).cmp(kind_b.verb(false)))
+        });
+        kinds.truncate(limit);
+        kinds
+    }
 }
 
 /// Unified scrollback state for the v3 pager.
@@ -381,6 +439,15 @@ impl ScrollbackState {
         self.gaps_may_be_dirty = true;
         self.invalidate_layout_cache();
         self.bump_content_generation();
+    }
+
+    /// Build a public-safe verification ledger from the current scrollback.
+    pub fn verification_ledger_snapshot(&self) -> VerificationLedgerSnapshot {
+        let mut snapshot = VerificationLedgerSnapshot::default();
+        for entry in self.entries.values() {
+            snapshot.record_entry(entry);
+        }
+        snapshot
     }
 
     /// Update the appearance configuration.
@@ -1978,6 +2045,35 @@ mod tests {
         assert!(state.is_empty());
         assert_eq!(state.len(), 0);
         assert_eq!(state.turn_count(), 0);
+    }
+
+    #[test]
+    fn verification_ledger_snapshot_counts_tool_call_outcomes() {
+        let mut state = ScrollbackState::new();
+        state.push(ScrollbackEntry::new(RenderBlock::ToolCall(
+            ToolCallBlock::Read(super::blocks::tool::ReadToolCallBlock::new("src/lib.rs")),
+        )));
+        state.push(ScrollbackEntry::new(RenderBlock::ToolCall(
+            ToolCallBlock::Execute(
+                super::blocks::tool::ExecuteToolCallBlock::new("cargo test")
+                    .with_error("boom"),
+            ),
+        )));
+        state.push(ScrollbackEntry::running(RenderBlock::ToolCall(
+            ToolCallBlock::Edit(super::blocks::tool::EditToolCallBlock::new(
+                "src/main.rs",
+                vec![],
+            )),
+        )));
+
+        let snapshot = state.verification_ledger_snapshot();
+        assert_eq!(snapshot.tool_calls, 3);
+        assert_eq!(snapshot.verified, 1);
+        assert_eq!(snapshot.failed, 1);
+        assert_eq!(snapshot.pending, 1);
+        assert_eq!(snapshot.kind_counts.get(&VerbGroupKind::File), Some(&1));
+        assert_eq!(snapshot.kind_counts.get(&VerbGroupKind::Command), Some(&1));
+        assert_eq!(snapshot.kind_counts.get(&VerbGroupKind::EditFile), Some(&1));
     }
 
     /// State with an explicit pager.toml-shaped `expanded_by_default` override; it is flag-independent (the `Some` wins over the cache).

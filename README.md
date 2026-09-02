@@ -111,6 +111,18 @@ selection, checkpoints, interruption/resume, reverse-order
 recovery/compensation, dry-run planning, and review protection for
 irreversible actions.
 
+### Execution Verification Ledger + Mission Control
+
+Adds a public-safe verification ledger derived from real tool-call execution
+rows in pager scrollback. The ledger records only aggregate execution facts:
+total tool calls, verified successes, failures, pending runs, and top activity
+lanes by tool category.
+
+The Agent Dashboard now renders a Mission Control strip in the header band,
+showing live ledger status across visible sessions and subagents. This view is
+count-only and intentionally excludes raw tool outputs, paths, prompts, and
+hidden reasoning.
+
 Custom additions are developed with focused crate-level validation and
 public-safe compatibility checks.
 
