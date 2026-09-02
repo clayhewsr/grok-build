@@ -26,9 +26,8 @@ pub struct AcpSessionFs {
     root: PathBuf,
     gateway: GatewaySender,
     session_id: acp::SessionId,
-    /// When set, any path under `display_cwd` is rewritten to `root` before
-    /// being sent to the extension.  This is the defense-in-depth guard for
-    /// AB overlay isolation: if a tool accidentally passes the display path
+    /// When set, any path under `display_cwd` is rewritten to `root` before being sent to the extension.
+    /// This is the defense-in-depth guard for AB overlay isolation: if a tool accidentally passes the display path
     /// (e.g., `/testbed/project/foo.rs`) instead of the overlay path
     /// (`~/.grok/worktrees/.../b-overlay/foo.rs`), the adapter rewrites it
     /// so the extension reads/writes to the correct overlay location.
@@ -45,12 +44,8 @@ impl AcpSessionFs {
         }
     }
 
-    /// Set the display CWD for path rewriting.
-    ///
-    /// When AB FS isolation is active, the model sees `display_cwd`
-    /// (e.g., `/testbed/project`) but writes should go to `root`
-    /// (the overlay path).  Any path under `display_cwd` is rewritten
-    /// to the equivalent path under `root`.
+    /// When AB FS isolation is active, the model sees `display_cwd` (e.g., `/testbed/project`) but writes should go to `root` (the overlay path).
+    /// Any path under `display_cwd` is rewritten to the equivalent path under `root`.
     pub fn with_display_cwd(mut self, display_cwd: PathBuf) -> Self {
         self.display_cwd = Some(display_cwd);
         self
@@ -159,12 +154,10 @@ impl AsyncFileSystem for AcpSessionFs {
 mod tests {
     use super::*;
 
-    // resolve_path only uses self.root and self.display_cwd — extract
-    // the logic into a standalone test helper that doesn't need a gateway.
+    // resolve_path only uses self.root and self.display_cwd, so this helper inlines the same logic without needing a gateway
     fn test_resolve(root: &str, display_cwd: Option<&str>, input: &str) -> PathBuf {
         let root = PathBuf::from(root);
         let display = display_cwd.map(PathBuf::from);
-        // Inline the same logic as resolve_path
         if let Some(ref display) = display
             && let Ok(suffix) = Path::new(input).strip_prefix(display)
         {
