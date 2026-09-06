@@ -432,20 +432,20 @@ mod tests {
                 disk_bytes: Some(DISK_WARN_THRESHOLD_BYTES + 1),
             }
         }
-
-        fn seam<'a>(&'a self) -> PreflightSeam<'a> {
-            PreflightSeam {
-                host_os: self.host_os,
-                resolve_command: &|name| self.commands.get(name).cloned(),
-                capture_first_line: &|name, _args| self.versions.get(name).cloned(),
-                available_disk_bytes: &|_path| self.disk_bytes,
-                probe_path: Path::new("."),
-            }
-        }
     }
 
     fn collect(fake: &FakeEnv) -> PreflightOutcome {
-        collect_preflight_with(&fake.seam())
+        let resolve_command = |name: &str| fake.commands.get(name).cloned();
+        let capture_first_line = |name: &str, _args: &[&str]| fake.versions.get(name).cloned();
+        let available_disk_bytes = |_path: &Path| fake.disk_bytes;
+        let seam = PreflightSeam {
+            host_os: fake.host_os,
+            resolve_command: &resolve_command,
+            capture_first_line: &capture_first_line,
+            available_disk_bytes: &available_disk_bytes,
+            probe_path: Path::new("."),
+        };
+        collect_preflight_with(&seam)
     }
 
     fn status_for(outcome: &PreflightOutcome, probe: &str) -> ProbeStatus {

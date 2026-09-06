@@ -2051,16 +2051,18 @@ mod tests {
     fn verification_ledger_snapshot_counts_tool_call_outcomes() {
         let mut state = ScrollbackState::new();
         state.push(ScrollbackEntry::new(RenderBlock::ToolCall(
-            ToolCallBlock::Read(super::blocks::tool::ReadToolCallBlock::new("src/lib.rs")),
+            ToolCallBlock::Read(crate::scrollback::blocks::tool::ReadToolCallBlock::new(
+                "src/lib.rs",
+            )),
         )));
         state.push(ScrollbackEntry::new(RenderBlock::ToolCall(
             ToolCallBlock::Execute(
-                super::blocks::tool::ExecuteToolCallBlock::new("cargo test")
+                crate::scrollback::blocks::tool::ExecuteToolCallBlock::new("cargo test")
                     .with_error("boom"),
             ),
         )));
         state.push(ScrollbackEntry::running(RenderBlock::ToolCall(
-            ToolCallBlock::Edit(super::blocks::tool::EditToolCallBlock::new(
+            ToolCallBlock::Edit(crate::scrollback::blocks::tool::EditToolCallBlock::new(
                 "src/main.rs",
                 vec![],
             )),

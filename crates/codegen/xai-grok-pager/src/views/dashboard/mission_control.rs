@@ -6,10 +6,11 @@ use ratatui::text::{Line, Span};
 
 use crate::app::agent::AgentId;
 use crate::app::agent_view::AgentView;
+use crate::render::line_utils::truncate_line;
 use crate::scrollback::state::VerificationLedgerSnapshot;
 use crate::theme::Theme;
+use crate::verification::tvl::TvlPublicSnapshot;
 use crate::views::agent_status::AgentStatusBar;
-use crate::render::line_utils::truncate_line;
 
 fn add_agent_snapshot(agent: &AgentView, snapshot: &mut VerificationLedgerSnapshot) {
     add_snapshot(snapshot, &agent.scrollback.verification_ledger_snapshot());
@@ -18,10 +19,7 @@ fn add_agent_snapshot(agent: &AgentView, snapshot: &mut VerificationLedgerSnapsh
     }
 }
 
-fn add_snapshot(
-    total: &mut VerificationLedgerSnapshot,
-    addition: &VerificationLedgerSnapshot,
-) {
+fn add_snapshot(total: &mut VerificationLedgerSnapshot, addition: &VerificationLedgerSnapshot) {
     total.tool_calls += addition.tool_calls;
     total.verified += addition.verified;
     total.failed += addition.failed;
@@ -31,7 +29,9 @@ fn add_snapshot(
     }
 }
 
-fn collect_mission_control_snapshot(agents: &IndexMap<AgentId, AgentView>) -> VerificationLedgerSnapshot {
+fn collect_mission_control_snapshot(
+    agents: &IndexMap<AgentId, AgentView>,
+) -> VerificationLedgerSnapshot {
     let mut snapshot = VerificationLedgerSnapshot::default();
     for agent in agents.values() {
         add_agent_snapshot(agent, &mut snapshot);
@@ -51,6 +51,7 @@ pub(crate) fn render_mission_control(
     area: Rect,
     theme: &Theme,
     agents: &IndexMap<AgentId, AgentView>,
+    tvl_snapshot: Option<&TvlPublicSnapshot>,
 ) {
     if area.area() == 0 || area.height == 0 {
         return;
@@ -61,10 +62,7 @@ pub(crate) fn render_mission_control(
 
     let mut status = AgentStatusBar::new(theme);
     if snapshot.tool_calls == 0 {
-        status.push(
-            "ledger",
-            chip("ledger idle", theme, theme.gray_dim),
-        );
+        status.push("ledger", chip("ledger idle", theme, theme.gray_dim));
     } else {
         if snapshot.verified > 0 {
             status.push(
@@ -79,13 +77,21 @@ pub(crate) fn render_mission_control(
         if snapshot.pending > 0 {
             status.push(
                 "pending",
-                chip(format!("pending {}", snapshot.pending), theme, theme.warning),
+                chip(
+                    format!("pending {}", snapshot.pending),
+                    theme,
+                    theme.warning,
+                ),
             );
         }
         if snapshot.failed > 0 {
             status.push(
                 "failed",
-                chip(format!("fail {}", snapshot.failed), theme, theme.accent_error),
+                chip(
+                    format!("fail {}", snapshot.failed),
+                    theme,
+                    theme.accent_error,
+                ),
             );
         }
         const TOP_KEYS: [&str; 3] = ["top_1", "top_2", "top_3"];
@@ -99,6 +105,19 @@ pub(crate) fn render_mission_control(
                 ),
             );
         }
+    }
+    if let Some(tvl) = tvl_snapshot {
+        status.push(
+            "tvl",
+            chip(
+                format!(
+                    "TVL {:?} r{}/{}",
+                    tvl.status, tvl.round_count, tvl.max_rounds
+                ),
+                theme,
+                theme.text_primary,
+            ),
+        );
     }
 
     let right_rects = status.render(buf, area);
@@ -116,6 +135,12 @@ pub(crate) fn render_mission_control(
         title_parts.push(format!(
             "{} tool calls · {} verified · {} pending · {} failed",
             snapshot.tool_calls, snapshot.verified, snapshot.pending, snapshot.failed
+        ));
+    }
+    if let Some(tvl) = tvl_snapshot {
+        title_parts.push(format!(
+            "TVL {:?} · agreement {:?} · unresolved {}",
+            tvl.status, tvl.agreement_state, tvl.unresolved_disagreements
         ));
     }
 

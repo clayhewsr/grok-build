@@ -50,6 +50,7 @@ pub mod tips;
 pub mod tool_usage;
 pub mod tutorial_docs;
 pub mod usage_cmd;
+pub mod verification;
 pub mod wrap_clipboard_image;
 pub mod wrap_cmd;
 pub(crate) mod wrap_filter;

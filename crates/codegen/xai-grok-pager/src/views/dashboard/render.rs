@@ -261,7 +261,7 @@ pub fn render_dashboard(
 
     // Header.
     render_header(buf, layout.header, &theme, &rows, state, upgrade_cta);
-    super::mission_control::render_mission_control(buf, layout.header_gap, &theme, agents);
+    super::mission_control::render_mission_control(buf, layout.header_gap, &theme, agents, None);
 
     // Body: key off visible rows (local agents and roster), not the local map alone
     if rows.is_empty() {
