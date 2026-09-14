@@ -365,6 +365,9 @@ impl StagedOperation {
         if checkpoint.operation_id != self.operation_id {
             return Err(StagedOperationError::CheckpointMismatch);
         }
+        if checkpoint.owner_session_id != self.owner_session_id {
+            return Err(StagedOperationError::CheckpointMismatch);
+        }
         if checkpoint.stages.len() != self.stage_order.len() {
             return Err(StagedOperationError::CheckpointMismatch);
         }
@@ -1276,6 +1279,22 @@ mod tests {
             .find(|s| s.stage_id == "a")
             .unwrap();
         assert_eq!(snap.status, StageStatus::Succeeded);
+    }
+
+    #[test]
+    fn checkpoint_restore_rejects_owner_session_mismatch() {
+        let mut operation = op(vec![stage("a", &[], StageExecutionClass::Reversible)]);
+        operation
+            .start_stage("a", "sess-1", "t1".to_string())
+            .unwrap();
+        operation.complete_stage("a", "t2".to_string()).unwrap();
+
+        let mut cp = operation.create_checkpoint("cp-1".to_string(), "t3".to_string());
+        cp.owner_session_id = "different-owner".to_string();
+
+        let mut restored = op(vec![stage("a", &[], StageExecutionClass::Reversible)]);
+        let err = restored.restore_checkpoint(&cp).unwrap_err();
+        assert_eq!(err, StagedOperationError::CheckpointMismatch);
     }
 
     #[test]
