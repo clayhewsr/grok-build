@@ -14,7 +14,7 @@ use crate::core_utility_belt::{
 use crate::field_boots::{
     FieldBootsDecision, FieldBootsRequest, TerrainInput, evaluate_field_boots,
 };
-use crate::prompt::context::PromptContext;
+use crate::prompt::context::{PromptContext, RenderedPrompt};
 use crate::system_reminder::ReminderPolicy;
 
 /// A fully built agent: an AgentDefinition plus its session context. Not portable.
@@ -308,6 +308,11 @@ impl Agent {
             .render(&self.tool_bridge)
             .await
             .unwrap_or_default();
+    }
+
+    /// The pair comes only from [`PromptContext::render_paired`], so the installed context always matches its prompt.
+    pub fn set_rendered_prompt(&mut self, rendered: RenderedPrompt) {
+        (self.prompt_context, self.system_prompt) = rendered.into_parts();
     }
 
     /// Re-render the system prompt for a different definition, reusing the existing ToolBridge.

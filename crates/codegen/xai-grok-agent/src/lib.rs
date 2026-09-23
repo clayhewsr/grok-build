@@ -2,6 +2,8 @@
 //!
 //! An `Agent` bundles tools, system prompt, system-reminder policy, compaction policy, and model configuration into one object any host can consume.
 
+#![deny(clippy::indexing_slicing)]
+
 pub mod agent;
 pub mod builder;
 pub mod compaction;
@@ -20,6 +22,7 @@ pub use agent::Agent;
 pub use builder::AgentBuilder;
 pub use compaction::CompactionPolicy;
 pub use config::AgentDefinition;
+pub use config::api_backed_tool_ids;
 pub use config::preset_names;
 pub use config::toolset_for_preset;
 pub use config::workspace_grok_build_toolset;
@@ -32,5 +35,5 @@ pub use field_boots::{
     FieldBootsDecision, FieldBootsRequest, KnownPrerequisite, RecoveryGrip, RouteDecision,
     SafeStepMode, TerrainAwareness, TerrainInput, evaluate_field_boots,
 };
-pub use prompt::context::{DEFAULT_SYSTEM_PROMPT_LABEL, PromptContext};
+pub use prompt::context::{DEFAULT_SYSTEM_PROMPT_LABEL, PromptContext, RenderedPrompt};
 pub use system_reminder::ReminderPolicy;
