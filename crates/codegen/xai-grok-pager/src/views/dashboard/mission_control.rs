@@ -14,7 +14,7 @@ use crate::views::agent_status::AgentStatusBar;
 
 fn add_agent_snapshot(agent: &AgentView, snapshot: &mut VerificationLedgerSnapshot) {
     add_snapshot(snapshot, &agent.scrollback.verification_ledger_snapshot());
-    for child in agent.subagent_views.values() {
+    for child in agent.subagent_views_iter() {
         add_agent_snapshot(child, snapshot);
     }
 }

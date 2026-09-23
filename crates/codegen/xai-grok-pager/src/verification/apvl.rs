@@ -297,10 +297,17 @@ impl ApvlController {
 
     pub fn record_completed_requirement(&mut self, requirement: impl Into<String>) {
         let requirement = requirement.into();
-        if !self.durable_state.completed_work.iter().any(|item| item == &requirement) {
+        if !self
+            .durable_state
+            .completed_work
+            .iter()
+            .any(|item| item == &requirement)
+        {
             self.durable_state.completed_work.push(requirement.clone());
         }
-        self.durable_state.remaining_work.retain(|item| item != &requirement);
+        self.durable_state
+            .remaining_work
+            .retain(|item| item != &requirement);
 
         for node in &mut self.task_graph {
             if node.id == requirement || node.requirement == requirement {
@@ -313,7 +320,12 @@ impl ApvlController {
 
     pub fn mark_blocked(&mut self, requirement: impl Into<String>) {
         let requirement = requirement.into();
-        if !self.durable_state.blockers.iter().any(|item| item == &requirement) {
+        if !self
+            .durable_state
+            .blockers
+            .iter()
+            .any(|item| item == &requirement)
+        {
             self.durable_state.blockers.push(requirement.clone());
         }
         for node in &mut self.task_graph {
@@ -339,7 +351,10 @@ impl ApvlController {
         let mut completed = self.durable_state.completed_work.clone();
         for node in &self.task_graph {
             if matches!(node.status, TaskNodeStatus::Complete) {
-                if !completed.iter().any(|item| item == &node.requirement || item == &node.id) {
+                if !completed
+                    .iter()
+                    .any(|item| item == &node.requirement || item == &node.id)
+                {
                     completed.push(node.requirement.clone());
                 }
             }
@@ -347,7 +362,13 @@ impl ApvlController {
         self.durable_state.completed_work = completed;
 
         let mut remaining = self.task_spec.required_outputs.clone();
-        remaining.retain(|item| !self.durable_state.completed_work.iter().any(|done| done == item));
+        remaining.retain(|item| {
+            !self
+                .durable_state
+                .completed_work
+                .iter()
+                .any(|done| done == item)
+        });
         self.durable_state.remaining_work = remaining;
 
         self.durable_state.constraints = self.task_spec.constraints.clone();
@@ -377,8 +398,10 @@ impl ApvlController {
         self.tvl_result = Some(status);
         if status == TvlRunStatus::Verified {
             self.claim_status = ClaimStatus::VerifiedResult;
-        } else if matches!(status, TvlRunStatus::Incomplete | TvlRunStatus::Blocked | TvlRunStatus::Failed)
-        {
+        } else if matches!(
+            status,
+            TvlRunStatus::Incomplete | TvlRunStatus::Blocked | TvlRunStatus::Failed
+        ) {
             self.claim_status = ClaimStatus::Unresolved;
         } else {
             self.claim_status = ClaimStatus::PartialResult;
@@ -392,7 +415,10 @@ impl ApvlController {
 
     pub fn coverage_complete(&self) -> bool {
         let required_outputs_complete = self.task_spec.required_outputs.iter().all(|output| {
-            self.durable_state.completed_work.iter().any(|done| done == output)
+            self.durable_state
+                .completed_work
+                .iter()
+                .any(|done| done == output)
         });
         let graph_complete = self.task_graph.iter().all(|node| {
             !matches!(
@@ -424,10 +450,16 @@ impl ApvlController {
                 steps.push(MissingStep {
                     missing_step_id: node.id.clone(),
                     category: "task_graph".to_string(),
-                    severity: if node.blocking { "critical".to_string() } else { "moderate".to_string() },
+                    severity: if node.blocking {
+                        "critical".to_string()
+                    } else {
+                        "moderate".to_string()
+                    },
                     affected_requirement: node.requirement.clone(),
                     blocking_yes_no: node.blocking,
-                    recommended_next_action: "target the unresolved task-graph node and repair only that dependency path".to_string(),
+                    recommended_next_action:
+                        "target the unresolved task-graph node and repair only that dependency path"
+                            .to_string(),
                 });
             }
         }
@@ -439,12 +471,17 @@ impl ApvlController {
                 severity: "critical".to_string(),
                 affected_requirement: requirement.clone(),
                 blocking_yes_no: true,
-                recommended_next_action: "resolve the pinned requirement before claiming completion".to_string(),
+                recommended_next_action:
+                    "resolve the pinned requirement before claiming completion".to_string(),
             });
         }
 
         for output in &self.task_spec.required_outputs {
-            let complete = self.durable_state.completed_work.iter().any(|done| done == output);
+            let complete = self
+                .durable_state
+                .completed_work
+                .iter()
+                .any(|done| done == output);
             if !complete {
                 steps.push(MissingStep {
                     missing_step_id: format!("out-{}", steps.len() + 1),
@@ -452,7 +489,8 @@ impl ApvlController {
                     severity: "critical".to_string(),
                     affected_requirement: output.clone(),
                     blocking_yes_no: true,
-                    recommended_next_action: "produce or verify the missing output before finalization".to_string(),
+                    recommended_next_action:
+                        "produce or verify the missing output before finalization".to_string(),
                 });
             }
         }
@@ -462,46 +500,56 @@ impl ApvlController {
 
     pub fn unresolved_count(&self) -> usize {
         let mut unresolved = self.task_spec.unresolved_requirements.len();
-        unresolved += self.task_graph.iter().filter(|node| {
-            matches!(
-                node.status,
-                TaskNodeStatus::Pending
-                    | TaskNodeStatus::Ready
-                    | TaskNodeStatus::InProgress
-                    | TaskNodeStatus::Blocked
-                    | TaskNodeStatus::Unresolved
-                    | TaskNodeStatus::Failed
-            )
-        }).count();
+        unresolved += self
+            .task_graph
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.status,
+                    TaskNodeStatus::Pending
+                        | TaskNodeStatus::Ready
+                        | TaskNodeStatus::InProgress
+                        | TaskNodeStatus::Blocked
+                        | TaskNodeStatus::Unresolved
+                        | TaskNodeStatus::Failed
+                )
+            })
+            .count();
         unresolved += self
             .task_spec
             .required_outputs
             .iter()
-            .filter(|output| !self.durable_state.completed_work.iter().any(|done| done == *output))
+            .filter(|output| {
+                !self
+                    .durable_state
+                    .completed_work
+                    .iter()
+                    .any(|done| done == *output)
+            })
             .count();
         unresolved
     }
 
     pub fn evaluate_decision(&self) -> ApvlDecision {
-        let required_output_missing = self
-            .task_spec
-            .required_outputs
-            .iter()
-            .any(|output| !self.durable_state.completed_work.iter().any(|done| done == output));
+        let required_output_missing = self.task_spec.required_outputs.iter().any(|output| {
+            !self
+                .durable_state
+                .completed_work
+                .iter()
+                .any(|done| done == output)
+        });
         let blocked_graph = self.task_graph.iter().any(|node| {
             node.blocking
                 || matches!(
                     node.status,
-                    TaskNodeStatus::Blocked
-                        | TaskNodeStatus::Unresolved
-                        | TaskNodeStatus::Failed
+                    TaskNodeStatus::Blocked | TaskNodeStatus::Unresolved | TaskNodeStatus::Failed
                 )
         });
         let unresolved_requirement_present = !self.task_spec.unresolved_requirements.is_empty();
         let blocking_missing = self.missing_steps.iter().any(|step| {
-            step.blocking_yes_no
-                && !matches!(step.category.as_str(), "missing_output")
-        }) || blocked_graph || unresolved_requirement_present;
+            step.blocking_yes_no && !matches!(step.category.as_str(), "missing_output")
+        }) || blocked_graph
+            || unresolved_requirement_present;
         let budget_exhausted = self.iteration_count >= self.max_iterations
             || self.compute_consumed >= self.max_model_calls + self.max_tool_calls;
 
@@ -549,7 +597,10 @@ impl ApvlController {
                 if self.coverage_complete() && self.tvl_result == Some(TvlRunStatus::Verified) {
                     StopReason::VerifiedComplete
                 } else if self.task_spec.required_outputs.iter().all(|output| {
-                    self.durable_state.completed_work.iter().any(|done| done == output)
+                    self.durable_state
+                        .completed_work
+                        .iter()
+                        .any(|done| done == output)
                 }) {
                     StopReason::AcceptanceCriteriaMet
                 } else if self.iteration_count >= self.max_iterations
@@ -613,7 +664,9 @@ impl ApvlController {
             self.claim_status,
             ClaimStatus::PartialResult | ClaimStatus::ConjecturalRoute | ClaimStatus::Unresolved
         ) {
-            return Err("partial or unresolved claim cannot be promoted to final output".to_string());
+            return Err(
+                "partial or unresolved claim cannot be promoted to final output".to_string(),
+            );
         }
 
         Ok(())
@@ -730,7 +783,9 @@ pub fn run_deterministic_ab_benchmark(task_spec: ApvlTaskSpec) -> BenchmarkCompa
     let existing_metrics = BenchmarkMetrics {
         completion_coverage: if existing.coverage_complete() { 1 } else { 0 },
         missed_requirements: existing.unresolved_count(),
-        premature_stops: usize::from(existing.decision == ApvlDecision::Stop && !existing.coverage_complete()),
+        premature_stops: usize::from(
+            existing.decision == ApvlDecision::Stop && !existing.coverage_complete(),
+        ),
         missing_steps_caught: existing.missing_steps.len(),
         refinements: usize::from(existing.decision == ApvlDecision::Refine),
         tvl_invocations: usize::from(existing.tvl_invoked),
@@ -744,7 +799,9 @@ pub fn run_deterministic_ab_benchmark(task_spec: ApvlTaskSpec) -> BenchmarkCompa
     let apvl_metrics = BenchmarkMetrics {
         completion_coverage: if with_apvl.coverage_complete() { 1 } else { 0 },
         missed_requirements: with_apvl.unresolved_count(),
-        premature_stops: usize::from(with_apvl.decision == ApvlDecision::Stop && !with_apvl.coverage_complete()),
+        premature_stops: usize::from(
+            with_apvl.decision == ApvlDecision::Stop && !with_apvl.coverage_complete(),
+        ),
         missing_steps_caught: with_apvl.missing_steps.len(),
         refinements: usize::from(with_apvl.decision == ApvlDecision::Refine),
         tvl_invocations: usize::from(with_apvl.tvl_invoked),
@@ -757,7 +814,13 @@ pub fn run_deterministic_ab_benchmark(task_spec: ApvlTaskSpec) -> BenchmarkCompa
 
     BenchmarkComparison {
         workload_id: fixture.workload_id,
-        config_hash: format!("{}:{}:{}:{}", fixture.config.model_provider, fixture.config.model_name, fixture.config.temperature, fixture.config.max_tokens),
+        config_hash: format!(
+            "{}:{}:{}:{}",
+            fixture.config.model_provider,
+            fixture.config.model_name,
+            fixture.config.temperature,
+            fixture.config.max_tokens
+        ),
         existing_path: existing_metrics,
         apvl_path: apvl_metrics,
     }
@@ -769,9 +832,15 @@ pub fn mission_control_apvl_lines(snapshot: &ApvlPublicSnapshot) -> Vec<String> 
         format!("RUN: {}", snapshot.run_id),
         format!("PROGRESS: {:?}", snapshot.progress_state),
         format!("DECISION: {:?}", snapshot.current_apvl_decision),
-        format!("REQUIREMENTS: {} complete / {} total", snapshot.requirements_complete, snapshot.requirements_total),
+        format!(
+            "REQUIREMENTS: {} complete / {} total",
+            snapshot.requirements_complete, snapshot.requirements_total
+        ),
         format!("UNRESOLVED: {}", snapshot.unresolved_count),
-        format!("CRITICAL MISSING STEPS: {}", snapshot.critical_missing_steps),
+        format!(
+            "CRITICAL MISSING STEPS: {}",
+            snapshot.critical_missing_steps
+        ),
         format!("TVL INVOKED: {}", snapshot.tvl_invoked),
         format!("TVL RESULT: {:?}", snapshot.tvl_result),
         format!("CLAIM STATUS: {:?}", snapshot.claim_status),
@@ -813,7 +882,9 @@ fn sanitize_run_id(raw: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::verification::tvl::{AgreementState, DriftFlag, EvidenceStatus, TvlEngine, TvlRoundInput, VerifierFeedback};
+    use crate::verification::tvl::{
+        AgreementState, DriftFlag, EvidenceStatus, TvlEngine, TvlRoundInput, VerifierFeedback,
+    };
 
     fn task_spec() -> ApvlTaskSpec {
         ApvlTaskSpec {
@@ -895,11 +966,18 @@ mod tests {
     #[test]
     fn missing_requirement_blocks_stop() {
         let mut controller = ApvlController::new("run-block", task_spec());
-        controller.task_spec.unresolved_requirements.push("final review".to_string());
+        controller
+            .task_spec
+            .unresolved_requirements
+            .push("final review".to_string());
         controller.refresh_durable_state();
         assert!(controller.determine_stop().is_none());
         let missing = controller.collect_missing_steps();
-        assert!(missing.iter().any(|step| step.affected_requirement == "final review"));
+        assert!(
+            missing
+                .iter()
+                .any(|step| step.affected_requirement == "final review")
+        );
     }
 
     #[test]
@@ -913,10 +991,12 @@ mod tests {
             blocking_yes_no: true,
             recommended_next_action: "add source".to_string(),
         });
-        assert!(controller
-            .missing_steps
-            .iter()
-            .any(|step| step.blocking_yes_no));
+        assert!(
+            controller
+                .missing_steps
+                .iter()
+                .any(|step| step.blocking_yes_no)
+        );
         assert_eq!(controller.evaluate_decision(), ApvlDecision::Refine);
     }
 
@@ -980,7 +1060,10 @@ mod tests {
         controller.compute_consumed = 9999;
         let stop = controller.determine_stop();
         assert!(stop.is_some());
-        assert_eq!(stop.unwrap().stop_reason, StopReason::ComputeBudgetExhausted);
+        assert_eq!(
+            stop.unwrap().stop_reason,
+            StopReason::ComputeBudgetExhausted
+        );
     }
 
     #[test]
@@ -997,7 +1080,13 @@ mod tests {
         let checkpoint = controller.checkpoint();
         let mut resumed = ApvlController::new("run-resume", task_spec());
         resumed.resume_from_checkpoint(checkpoint);
-        assert!(resumed.durable_state.completed_work.iter().any(|item| item == "answer"));
+        assert!(
+            resumed
+                .durable_state
+                .completed_work
+                .iter()
+                .any(|item| item == "answer")
+        );
     }
 
     #[test]
@@ -1011,9 +1100,17 @@ mod tests {
     #[test]
     fn unresolved_requirement_survives_long_execution() {
         let mut controller = ApvlController::new("run-long", task_spec());
-        controller.task_spec.unresolved_requirements.push("late requirement".to_string());
+        controller
+            .task_spec
+            .unresolved_requirements
+            .push("late requirement".to_string());
         controller.refresh_durable_state();
-        assert!(controller.task_spec.unresolved_requirements.contains(&"late requirement".to_string()));
+        assert!(
+            controller
+                .task_spec
+                .unresolved_requirements
+                .contains(&"late requirement".to_string())
+        );
     }
 
     #[test]
@@ -1021,7 +1118,15 @@ mod tests {
         let mut controller = ApvlController::new("run-dedupe", task_spec());
         controller.record_completed_requirement("answer");
         controller.record_completed_requirement("answer");
-        assert_eq!(controller.durable_state.completed_work.iter().filter(|item| *item == &"answer".to_string()).count(), 1);
+        assert_eq!(
+            controller
+                .durable_state
+                .completed_work
+                .iter()
+                .filter(|item| *item == &"answer".to_string())
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1068,14 +1173,22 @@ mod tests {
             evidence_refs: vec![],
         });
         controller.refresh_durable_state();
-        assert!(controller.missing_steps.iter().any(|step| step.affected_requirement == "evidence"));
+        assert!(
+            controller
+                .missing_steps
+                .iter()
+                .any(|step| step.affected_requirement == "evidence")
+        );
     }
 
     #[test]
     fn converged_is_not_verified() {
         let snapshot = valid_tvl_snapshot();
         assert_eq!(snapshot.status, TvlRunStatus::Verified);
-        assert_eq!(snapshot.agreement_state, crate::verification::tvl::AgreementState::FullAgreement);
+        assert_eq!(
+            snapshot.agreement_state,
+            crate::verification::tvl::AgreementState::FullAgreement
+        );
     }
 
     #[test]
@@ -1137,9 +1250,18 @@ mod tests {
     fn ab_workloads_are_identical_and_only_apvl_differs() {
         let result = run_deterministic_ab_benchmark(task_spec());
         assert_eq!(result.workload_id, "ab-deterministic");
-        assert_eq!(result.existing_path.completion_coverage, result.apvl_path.completion_coverage);
-        assert_eq!(result.existing_path.missed_requirements, result.apvl_path.missed_requirements);
-        assert_eq!(result.existing_path.model_calls, result.apvl_path.model_calls);
+        assert_eq!(
+            result.existing_path.completion_coverage,
+            result.apvl_path.completion_coverage
+        );
+        assert_eq!(
+            result.existing_path.missed_requirements,
+            result.apvl_path.missed_requirements
+        );
+        assert_eq!(
+            result.existing_path.model_calls,
+            result.apvl_path.model_calls
+        );
         assert_eq!(result.existing_path.tool_calls, result.apvl_path.tool_calls);
         assert!(result.config_hash.contains("stub-provider"));
     }

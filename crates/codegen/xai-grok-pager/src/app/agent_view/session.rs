@@ -482,6 +482,9 @@ impl AgentView {
     pub(crate) fn subagent_view_mut(&mut self, child_sid: &str) -> Option<&mut AgentView> {
         self.subagent_views.get_mut(child_sid).map(|v| &mut **v)
     }
+    pub(crate) fn subagent_views_iter(&self) -> impl Iterator<Item = &AgentView> {
+        self.subagent_views.values().map(|v| &**v)
+    }
     pub(crate) fn has_subagent_view(&self, child_sid: &str) -> bool {
         self.subagent_views.contains_key(child_sid)
     }
