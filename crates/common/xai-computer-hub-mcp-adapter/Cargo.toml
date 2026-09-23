@@ -25,6 +25,7 @@ xai-computer-hub-sdk = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 futures = { workspace = true }
+tokio-util = { workspace = true }
 
 [lints]
 workspace = true
